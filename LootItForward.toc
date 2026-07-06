@@ -2,7 +2,7 @@
 ## Title: Loot It Forward
 ## Notes: Alerts you when a loot drop would be an upgrade for another party member.
 ## Author: Alesh
-## Version: 1.0.0
+## Version: 1.0.1
 ## IconTexture: Interface\AddOns\LootItForward\Icon
 ## SavedVariables: LootItForwardDB, LootItForwardLog
 ## OptionalDeps: WoWUnit
