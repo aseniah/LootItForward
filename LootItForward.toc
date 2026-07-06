@@ -6,6 +6,7 @@
 ## IconTexture: Interface\AddOns\LootItForward\Icon
 ## SavedVariables: LootItForwardDB, LootItForwardLog
 ## OptionalDeps: WoWUnit
+## X-Curse-Project-ID: 1599656
 
 libs\LibStub\LibStub.lua
 libs\CallbackHandler-1.0\CallbackHandler-1.0.lua
