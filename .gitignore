@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Third-party libs are vendored directly (no .pkgmeta publishing pipeline yet)
+# libs/ intentionally tracked in git
+
+# Test output
+luacov.stats.out
+luacov.report.out
+*.log
+
+# Packaged builds
+*.zip
+
+# GSD internal
+.claude/worktrees/
+
+# Superpowers brainstorm sessions
+.superpowers/
+
+.DS_Store

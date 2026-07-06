@@ -1,0 +1,42 @@
+{
+  "Lua.runtime.version": "Lua 5.1",
+  "Lua.workspace.ignoreDir": ["libs", "tests"],
+  "Lua.diagnostics.globals": [
+    "LE_ITEM_BIND_ON_PICKUP",
+    "INSPECT_READY",
+    "GROUP_ROSTER_UPDATE",
+    "RAID_ROSTER_UPDATE",
+    "PLAYER_LOOT_ITEM",
+    "PLAYER_ENTERING_WORLD",
+    "PLAYER_REGEN_ENABLED",
+    "SlashCmdList",
+    "DEFAULT_CHAT_FRAME",
+    "ITEM_QUALITY_COLORS",
+    "RAID_CLASS_COLORS",
+    "ChatFrame_OpenChat",
+    "ShoppingTooltip1",
+    "ShoppingTooltip2",
+    "ChatEdit_InsertLink",
+    "SOUNDKIT",
+    "Settings",
+    "EditBox_ClearFocus",
+    "MinimalSliderWithSteppersMixin",
+    "CreateMinimalSliderFormatter",
+    "BIND_TRADE_TIME_REMAINING"
+  ],
+  "Lua.runtime.builtin": {
+    "basic": "disable",
+    "debug": "disable",
+    "io": "disable",
+    "math": "disable",
+    "os": "disable",
+    "package": "disable",
+    "string": "disable",
+    "table": "disable",
+    "utf8": "disable"
+  },
+  "Lua.workspace.library": [
+    "~/.vscode/extensions/ketho.wow-api-0.22.3/Annotations/Core"
+  ],
+  "Lua.type.weakUnionCheck": true
+}
