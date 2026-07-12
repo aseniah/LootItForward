@@ -100,6 +100,11 @@ end
 
 -- Set up a member in cache with gear and register mock API state.
 -- gearTable: { [slotID] = ilvl, ... }
+-- Production caches equipLoc per slot at inspect time (M1); the weapon slots
+-- default to a generic 1H so is2HEquipped reads false and the offhand fail-closed
+-- guard doesn't fire. Tests needing a two-hander call equipMember2H (or set
+-- gear[16].equipLoc = "INVTYPE_2HWEAPON" directly).
+local DEFAULT_SLOT_EQUIPLOC = { [16] = "INVTYPE_WEAPON", [17] = "INVTYPE_WEAPONOFFHAND" }
 local function mockMemberGear(guid, unit, classToken, specID, gearTable)
   _mockGuids[unit] = guid
   _mockUnitClass[unit] = { classToken, classToken }
@@ -111,7 +116,7 @@ local function mockMemberGear(guid, unit, classToken, specID, gearTable)
     local link = "item:" .. guid .. "s" .. slotID
     _mockGearLinks[unit][slotID] = link
     _mockIlvl[link] = ilvl
-    cacheGear[slotID] = { link = link, ilvl = ilvl }
+    cacheGear[slotID] = { link = link, ilvl = ilvl, equipLoc = DEFAULT_SLOT_EQUIPLOC[slotID] }
   end
   LIF.Cache.SetComplete(guid, { gear = cacheGear, specID = specID })
 end
@@ -121,11 +126,9 @@ end
 -- ============================================================
 TestLoot = {}
 
--- Capture the original no-op stubs from loot.lua so setUp can restore them after
--- any test that overrides them with spies.
+-- Capture the original no-op ShowPopup stub from loot.lua so setUp can restore it
+-- after any test that overrides it with a spy.
 local _origShowPopup          = LIF.ShowPopup
-local _origPopupUpdateCand    = LIF.Popup_UpdateCandidate
-local _origPopupRemoveCand    = LIF.Popup_RemoveCandidate
 
 function TestLoot:setUp()
   ResetMocks()
@@ -133,10 +136,8 @@ function TestLoot:setUp()
   LIF.Queue_StopAndReset()
   -- Reset pending loot state so tests are isolated (EvaluateCandidates/OnLootInspectReady).
   LIF.pendingLootItems = {}
-  -- Restore popup stubs so tests that nil them out don't bleed into subsequent tests.
+  -- Restore the ShowPopup stub so tests that spy on it don't bleed into subsequent tests.
   LIF.ShowPopup             = _origShowPopup
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-  LIF.Popup_RemoveCandidate = _origPopupRemoveCand
   -- Restore the mock IsItemTradeable override (tests in TestIsItemTradeable swap to real impl).
   _mockNonTradeableItems = {}
   LIF.IsItemTradeable = mockIsItemTradeable
@@ -164,25 +165,12 @@ function TestLoot:test_ring_no_upgrade_both_higher()
   )
 end
 
-function TestLoot:test_trinket_upgrade_stat_match()
+function TestLoot:test_trinket_upgrade_over_lower_slot()
   -- droppedIlvl=440, trinkets={slot13=420, slot14=430}, threshold=10
   -- lower trinket = 420; delta = 440 - 420 = 20 >= 10 → true
   lu.assertTrue(
     LIF.IsTrinketUpgrade(440, { slot13 = 420, slot14 = 430 }, 10),
     "Trinket drop is upgrade over lower slot (delta 20 >= threshold 10)"
-  )
-  -- Stat compatibility: AGI == AGI → true
-  lu.assertTrue(
-    LIF.IsTrinketCompatible("AGI", "AGI"),
-    "AGI trinket is compatible with AGI spec"
-  )
-end
-
-function TestLoot:test_trinket_skip_stat_mismatch()
-  -- Stat compatibility: AGI != INT → false
-  lu.assertFalse(
-    LIF.IsTrinketCompatible("AGI", "INT"),
-    "AGI trinket is NOT compatible with INT spec"
   )
 end
 
@@ -346,6 +334,21 @@ function TestLoot:test_weapon_self_upgrade_stat_mismatch()
   lu.assertTrue(true, "test_weapon_self_upgrade_stat_mismatch: reached past skip guard")
 end
 
+function TestLoot:test_mainhand_only_weapon_classifies_to_slot_16()
+  -- INVTYPE_WEAPONMAINHAND (main-hand-only weapons — common on leveling/caster
+  -- loot) must classify like any weapon. This runs through the REAL ClassifyItem
+  -- rather than an sff fixture, because the gap was a missing EQUIP_LOC_SLOTS
+  -- entry that fixtures bypass. Sibling of REV-001 (INVTYPE_RANGED/RANGEDRIGHT).
+  local link = "item:mh_only_dagger"
+  local itemData = classifyMockItem(link,
+    { "MH Dagger", nil, 4, 490, nil, "Weapon", "Daggers", nil, "INVTYPE_WEAPONMAINHAND", nil, nil, 2, 15, 0 },
+    { ITEM_MOD_AGILITY_SHORT = 120 })
+  lu.assertNotNil(itemData, "INVTYPE_WEAPONMAINHAND must not be skipped by ClassifyItem")
+  lu.assertEquals(itemData.slotCategory, "weapon")
+  lu.assertEquals(itemData.slotIDs, { 16 })
+  lu.assertEquals(itemData.weaponSubID, 15)
+end
+
 function TestLoot:test_neck_self_upgrade_ilvl_only()
   -- Neck with no primary stats (GetItemStats returns {}): ilvl 480 vs 460, threshold 10 → true.
   local link = "item:neck"
@@ -406,14 +409,17 @@ end
 -- RequestReinspect and scan stabilization (Task 0 — queue.lua)
 -- ============================================================
 
-function TestLoot:test_request_reinspect_resets_gear_sets_pending()
-  -- Set up a COMPLETE member, then call RequestReinspect.
-  -- After: state == PENDING and gear is empty (D-14).
+function TestLoot:test_request_reinspect_retains_gear_snapshot_sets_pending()
+  -- RequestReinspect flips the member to PENDING for a fresh loot-time scan but
+  -- RETAINS the last COMPLETE gear as a fallback snapshot (cache-fallback): if the
+  -- fresh inspect can't finish (dead/offline/window expiry) the pipeline evaluates
+  -- against this snapshot instead of dropping the member. SetComplete overwrites it
+  -- wholesale when fresh data lands; OnLootInspectReady's COMPLETE gate ignores it
+  -- until then. (Supersedes the old "must clear gear" D-14 behavior.)
   local guid = "Player-0-TestReinspect"
   local unit = "party1"
   mockMemberGear(guid, unit, "DRUID", 103, { [5] = 460, [11] = 440, [12] = 450 })
 
-  -- Confirm COMPLETE before test
   local memberBefore = LIF.Cache.GetMember(guid)
   lu.assertEquals(memberBefore.state, "COMPLETE", "Precondition: member must be COMPLETE")
 
@@ -422,13 +428,13 @@ function TestLoot:test_request_reinspect_resets_gear_sets_pending()
   local memberAfter = LIF.Cache.GetMember(guid)
   lu.assertNotNil(memberAfter, "Member must still be in cache after RequestReinspect")
   lu.assertEquals(memberAfter.state, "PENDING",
-    "RequestReinspect must set state to PENDING (D-14)")
-  -- Gear should be empty
+    "RequestReinspect must set state to PENDING")
   local gearCount = 0
   if memberAfter.gear then
     for _ in pairs(memberAfter.gear) do gearCount = gearCount + 1 end
   end
-  lu.assertEquals(gearCount, 0, "RequestReinspect must clear gear data (D-14)")
+  lu.assertEquals(gearCount, 3,
+    "RequestReinspect must RETAIN the gear snapshot for cache-fallback")
 end
 
 function TestLoot:test_request_reinspect_queues_at_front()
@@ -560,7 +566,10 @@ function TestLoot:test_scan_stabilization_completes_on_consistent_slots()
     LIF.TryQueuePendingMembers()
   end
 
-  -- 2nd fire: slotCount=5, consistentCount=2 — should NOT complete
+  -- 2nd fire: slotCount=5, consistentCount=2 — should NOT complete.
+  -- Advance the clock past MIN_HARVEST_SPACING (LIF's own retry cadence is ~2s):
+  -- a counted stabilization fire only advances if adequately spaced (M7).
+  _mockTime = _mockTime + 2
   LIF.OnInspectReady(guid)
   local m2 = LIF.Cache.GetMember(guid)
   lu.assertNotEquals((m2 and m2.state), "COMPLETE",
@@ -575,7 +584,8 @@ function TestLoot:test_scan_stabilization_completes_on_consistent_slots()
     LIF.TryQueuePendingMembers()
   end
 
-  -- 3rd fire: slotCount=5, consistentCount=3 — SHOULD complete (stabilization)
+  -- 3rd fire: slotCount=5, consistentCount=3 — SHOULD complete (stabilization).
+  _mockTime = _mockTime + 2
   LIF.OnInspectReady(guid)
   local m3 = LIF.Cache.GetMember(guid)
   lu.assertEquals((m3 and m3.state), "COMPLETE",
@@ -695,11 +705,6 @@ function TestLoot:test_candidate_sort_delta_desc()
     showPopupArgs = { itemData = itemData, candidates = candidates }
   end
 
-  local updateCandidateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, link)
-    table.insert(updateCandidateCalls, { guid = g })
-  end
-
   local itemData = { link = "item:sort_ring", ilvl = 500, slotID = 11,
                      equipLoc = "INVTYPE_FINGER", slotIDs = {11, 12}, slotCategory = "ring",
                      itype = "Armor", subtype = "Miscellaneous" }
@@ -727,10 +732,8 @@ function TestLoot:test_candidate_sort_delta_desc()
   lu.assertEquals(showPopupArgs.candidates[1].guid, druidGuid, "Druid (delta 25) must be first")
   lu.assertEquals(showPopupArgs.candidates[2].guid, rogueGuid, "Rogue (delta 18) must be second")
   lu.assertEquals(showPopupArgs.candidates[3].guid, monkGuid,  "Monk (delta 12) must be third")
-  lu.assertEquals(#updateCandidateCalls, 0, "Popup_UpdateCandidate must not be called (popup was not open)")
 
   LIF.ShowPopup             = _origShowPopup
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
 end
 
 function TestLoot:test_popup_opens_after_all_scans_resolve()
@@ -778,171 +781,20 @@ function TestLoot:test_popup_opens_after_all_scans_resolve()
   LIF.ShowPopup = _origShowPopup
 end
 
-function TestLoot:test_ring_party_eligibility_lower_slot()
-  -- via callOnLootInspectReady: ring drop ilvl 470, member just-inspected with
-  -- gear[11]=460 gear[12]=475, threshold 10 → UpdateCandidate called with delta=10 slotID=11.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-RingTest"
-  mockMemberGear(guid, "party1", "DRUID", 103, { [11] = 460, [12] = 475 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCandidateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCandidateCalls, { guid = g, data = data, itemLink = itemLink })
-  end
-
-  local itemData = { link = "item:ring_party", ilvl = 470, slotID = 11,
-                     equipLoc = "INVTYPE_FINGER", slotIDs = {11, 12}, slotCategory = "ring",
-                     itype = "Armor", subtype = "Miscellaneous" }
-
-  -- Pre-populate a pending loot entry with this member scanning and popup already open.
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,  -- popup already open → UpdateCandidate expected
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#updateCandidateCalls > 0,
-    "Popup_UpdateCandidate must be called when member is eligible (delta=10 >= threshold)")
-
-  LIF.Popup_UpdateCandidate = nil
+function TestLoot:test_heirloom_adjusted_ilvl_exposed()
+  -- AUD-308: HeirloomAdjustedIlvl is exposed so the popup header's ring/trinket hover
+  -- can pick the same heirloom-adjusted lower-of-two slot the eligibility engine uses.
+  lu.assertNotNil(LIF.HeirloomAdjustedIlvl, "HeirloomAdjustedIlvl must be exposed on LIF")
+  _mockHeirloomItemIDs[77001] = true
+  lu.assertEquals(LIF.HeirloomAdjustedIlvl("item:77001", 50, 120), math.huge,
+    "active heirloom (level<=69) reads as math.huge so it never wins the low side")
+  lu.assertEquals(LIF.HeirloomAdjustedIlvl("item:77001", 80, 120), 120,
+    "above level 69 the heirloom is inactive → raw ilvl")
+  lu.assertEquals(LIF.HeirloomAdjustedIlvl("item:99999", 50, 200), 200,
+    "non-heirloom link → raw ilvl")
+  lu.assertEquals(LIF.HeirloomAdjustedIlvl(nil, 50, 0), 0,
+    "empty slot (nil link) → raw ilvl (0)")
 end
-
-function TestLoot:test_weapon_party_uses_cached_ilvl_when_live_read_wiped()
-  -- ClearInspectPlayer (OnInspectReady) releases the live inspect data before
-  -- OnLootInspectReady runs, so a live weapon read returns nil -> ilvl 0 and
-  -- fabricates a full-ilvl upgrade. The compare must read the gear snapshot
-  -- captured during the same inspect (here, ilvl 70) instead.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-CacheWeaponDruid"
-  -- Balance druid (102, INT): cache holds a main-hand weapon at ilvl 70.
-  mockMemberGear(guid, "party1", "DRUID", 102, { [16] = 70 })
-  -- Simulate ClearInspectPlayer: the LIVE slot-16 read now returns nil, while
-  -- the cache (member.gear[16]) still holds the weapon.
-  _mockGearLinks["party1"][16] = nil
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCandidateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCandidateCalls, { guid = g, data = data, itemLink = itemLink })
-  end
-
-  -- INT dagger (classID 2, subID 15) usable by Balance main-hand, ilvl 220.
-  local link = "item:cache_weapon_dagger"
-  local itemData = classifyMockItem(link,
-    { "INTDagger", nil, 4, 220, nil, "Weapon", "Daggers", nil, "INVTYPE_WEAPON", nil, nil, 2, 15, 0 },
-    { ITEM_MOD_INTELLECT_SHORT = 190 })
-
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 1,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,  -- popup open → UpdateCandidate carries the candidate
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertEquals(#updateCandidateCalls, 1, "eligible weapon candidate must update the popup")
-  local cand = updateCandidateCalls[1].data
-  lu.assertEquals(cand.ilvl_current, 70,
-    "weapon compare must use the cached MH ilvl (70), not the wiped live read (0)")
-  lu.assertEquals(cand.delta, 150,
-    "delta must be 220-70=150, not the fabricated 220")
-
-  LIF.Popup_UpdateCandidate = nil
-end
-
-function TestLoot:test_trinket_party_stat_mismatch()
-  -- AGI trinket drop, member just-inspected with INT spec → NOT eligible.
-  -- Popup_RemoveCandidate must be called.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-IntSpec"
-  mockMemberGear(guid, "party1", "PRIEST", 256, { [13] = 450, [14] = 450 })  -- Disc Priest (INT)
-  _mockGuids["player"] = "GUID-SELF"
-
-  local removeCandidateCalls = {}
-  LIF.Popup_RemoveCandidate = function(g, itemLink)
-    table.insert(removeCandidateCalls, { guid = g, itemLink = itemLink })
-  end
-
-  local link = "item:agi_trinket"
-  _mockItemStats[link] = { ITEM_MOD_AGILITY_SHORT = 150 }
-  local itemData = { link = link, ilvl = 470, slotID = 13,
-                     equipLoc = "INVTYPE_TRINKET", slotIDs = {13, 14}, slotCategory = "trinket",
-                     itype = "Armor", subtype = "Trinket", primaryStats = { AGI = true } }
-
-  -- Pre-populate a pending loot entry with this member scanning and popup already open.
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,  -- popup open → RemoveCandidate expected on ineligible
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#removeCandidateCalls > 0,
-    "Popup_RemoveCandidate must be called when trinket stat mismatches member spec (INT != AGI)")
-
-  LIF.Popup_RemoveCandidate = nil
-end
-
-function TestLoot:test_trinket_party_no_primary_stat_ilvl_only()
-  -- Secondary-stat trinket: no AGI/STR/INT from GetItemStats.
-  -- Member lower trinket ilvl 450, drop ilvl 470, threshold 10 → eligible (ring rules).
-  -- Popup_UpdateCandidate must be called.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-SecTrinket"
-  mockMemberGear(guid, "party1", "DRUID", 103, { [13] = 450, [14] = 460 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCandidateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCandidateCalls, { guid = g, data = data, itemLink = itemLink })
-  end
-
-  local link = "item:sec_trinket_party"
-  _mockItemStats[link] = { ITEM_MOD_HASTE_RATING_SHORT = 120 }  -- no primary stat
-  local itemData = { link = link, ilvl = 470, slotID = 13,
-                     equipLoc = "INVTYPE_TRINKET", slotIDs = {13, 14}, slotCategory = "trinket",
-                     itype = "Armor", subtype = "Trinket" }  -- no primaryStat key (ilvl-only)
-
-  -- Pre-populate a pending loot entry with this member scanning and popup already open.
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#updateCandidateCalls > 0,
-    "Popup_UpdateCandidate must be called for secondary-stat trinket (ilvl-only rules)")
-
-  LIF.Popup_UpdateCandidate = nil
-end
-
 
 -- ============================================================
 -- Loot entry + tradeability gate
@@ -996,6 +848,82 @@ function TestLoot:test_tradeable_item_proceeds()
     lu.assertEquals(LIF.pendingLootItems[1].scanningGuids[druidGuid], true,
       "Druid must be in scanningGuids for tradeable leather chest")
   end
+end
+
+function TestLoot:test_loot_reset_cancels_pending_tradeability_defer()
+  -- AUD-010: if Loot_Reset fires (group disband / inactive transition) in the
+  -- window between ENCOUNTER_LOOT_RECEIVED and the one-frame tradeability defer
+  -- running, the deferred confirmTradeableAndProceed must NOT proceed against the
+  -- now-cleared state — otherwise it emits a "0 candidates" chat line and appends
+  -- an orphan pending entry after the reset. A loot generation token guards it.
+  _mockIsInInstance = { true, "party" }
+  _mockIsInGroup    = true
+
+  local link = "item:tradeable_leather_chest_reset"
+  mockItem(link, { "TradeableChest", nil, 4, 480, nil, "Armor", "Leather", nil, "INVTYPE_CHEST", nil, nil, 4, 2, 1 })
+
+  local druidGuid = "Player-0-ResetDruid"
+  mockMemberGear(druidGuid, "party1", "DRUID", 103, { [5] = 460 })
+  _mockGuids["player"] = "GUID-SELF"
+  _mockGearLinks["player"] = { [5] = "item:player_chest_same_reset" }
+  _mockIlvl["item:player_chest_same_reset"] = 480
+
+  callOnLoot(link, 12399)
+  LIF.Loot_Reset()              -- group disbands before the tradeability defer fires
+  FirePendingAfterCallbacks()   -- fire the 0-frame defer
+
+  lu.assertEquals(#LIF.pendingLootItems, 0,
+    "a Loot_Reset before the tradeability defer must cancel it — no orphan pending entry (AUD-010)")
+end
+
+function TestLoot:test_nil_ilvl_item_skipped()
+  -- A classified item with nil ilvl (GetItemInfo returned a name but no item
+  -- level) must be skipped outright. IsPlayerUpgrade already fails safe on nil
+  -- ilvl, but without an early skip the pipeline proceeds into member
+  -- evaluation, where the (droppedIlvl - current) delta throws on the nil.
+  -- Practically unreachable (ClassifyItem bails on nil GetItemInfo) but the
+  -- guard keeps the arithmetic safe.
+  _mockIsInInstance = { true, "party" }
+  _mockIsInGroup    = true
+
+  local link = "item:nil_ilvl_chest"
+  mockItem(link, { "NilIlvlChest", nil, 4, nil, nil, "Armor", "Leather", nil, "INVTYPE_CHEST", nil, nil, 4, 2, 1 })
+  local druidGuid = "Player-0-NilIlvlDruid"
+  mockMemberGear(druidGuid, "party1", "DRUID", 103, { [5] = 460 })
+  _mockGuids["player"] = "GUID-SELF"
+  _mockGearLinks["player"] = { [5] = "item:player_chest_nil" }
+  _mockIlvl["item:player_chest_nil"] = 480
+
+  callOnLoot(link, 12399)
+  FirePendingAfterCallbacks()
+
+  lu.assertEquals(#LIF.pendingLootItems, 0,
+    "Item with nil ilvl must be skipped before candidate evaluation")
+end
+
+function TestLoot:test_specless_player_drop_ignored()
+  -- A local player with no active spec (below level 10, or never chosen) can't
+  -- be self-checked: the stat/weapon self-upgrade branches fail closed, which
+  -- for the LOCAL player inverts to "not an upgrade for me → offer it away" and
+  -- risks giving away the player's own upgrade. With nothing reliable to
+  -- compare against, the drop must be ignored outright (no pending entry).
+  _mockIsInInstance = { true, "party" }
+  _mockIsInGroup    = true
+
+  local link = "item:specless_trinket"
+  mockItem(link, { "SpeclessTrinket", nil, 4, 500, nil, "Armor", "Trinket", nil, "INVTYPE_TRINKET", nil, nil, 4, 0, 0 })
+  _mockItemStats[link] = { ITEM_MOD_AGILITY_SHORT = 200 }
+  _mockGuids["player"] = "GUID-SELF"
+  _mockGearLinks["player"] = { [13] = "item:pt1", [14] = "item:pt2" }
+  _mockIlvl["item:pt1"] = 450
+  _mockIlvl["item:pt2"] = 450
+  _mockGetSpecialization = 0  -- no active spec
+
+  callOnLoot(link, 55123)
+  FirePendingAfterCallbacks()
+
+  lu.assertEquals(#LIF.pendingLootItems, 0,
+    "A drop must be ignored when the local player has no active spec")
 end
 
 function TestLoot:test_loot_in_combat_defers_reinspect_until_combat_end()
@@ -1063,77 +991,6 @@ function TestLoot:test_pending_member_queue_called_at_loot()
     "At least one NotifyInspect must fire for a PENDING member at loot time")
 end
 
-function TestLoot:test_on_loot_inspect_ready_updates_candidate_when_resolves_eligible()
-  -- Pending loot item state present with a scanning placeholder for guid G.
-  -- popup already opened (entry.popupOpened = true).
-  -- After callOnLootInspectReady(G) resolves eligible → Popup_UpdateCandidate called once.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-UpdateCandidate"
-  mockMemberGear(guid, "party1", "DRUID", 103, { [11] = 450, [12] = 460 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g, data = data, itemLink = itemLink })
-  end
-
-  -- Pre-populate a pending loot entry with this member scanning and popup already open.
-  local ringItemData = { link = "item:ring_update_test", ilvl = 470,
-                         slotIDs = {11, 12}, slotCategory = "ring" }
-  table.insert(LIF.pendingLootItems, {
-    itemData            = ringItemData,
-    t                   = 0,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,  -- popup already open → UpdateCandidate on eligible
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#updateCalls >= 1,
-    "Popup_UpdateCandidate must be called once when member resolves eligible (D-09)")
-
-  LIF.Popup_UpdateCandidate = nil
-end
-
-function TestLoot:test_on_loot_inspect_ready_removes_candidate_when_resolves_ineligible()
-  -- Same setup but resolved member fails eligibility → Popup_RemoveCandidate called once.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  -- Warrior trying to get leather chest — ineligible (armor type mismatch).
-  local guid = "Player-0-RemoveCandidate"
-  mockMemberGear(guid, "party1", "WARRIOR", 72, { [5] = 460 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local removeCalls = {}
-  LIF.Popup_RemoveCandidate = function(g, itemLink)
-    table.insert(removeCalls, { guid = g, itemLink = itemLink })
-  end
-
-  -- Pre-populate a pending loot entry with a leather chest; Warrior is ineligible (plate class).
-  local chestItemData = { link = "item:leather_chest_remove_test", ilvl = 480,
-                           slotIDs = {5}, slotCategory = "armor", armorType = "Leather" }
-  table.insert(LIF.pendingLootItems, {
-    itemData            = chestItemData,
-    t                   = 0,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,  -- popup open → RemoveCandidate expected on ineligible
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#removeCalls >= 1,
-    "Popup_RemoveCandidate must be called once when member resolves ineligible (D-09)")
-
-  LIF.Popup_RemoveCandidate = nil
-end
-
 -- ============================================================
 -- Plan 03-05: full pipeline tests (TDD — new for this plan)
 -- ============================================================
@@ -1166,27 +1023,26 @@ function TestLoot:test_self_upgrade_skip_in_pipeline()
     "Self-upgrade must cause early return; pendingLootItems must remain empty (D-13)")
 end
 
-function TestLoot:test_four_second_timer_drops_unresolved_scanning_guids()
-  -- EvaluateCandidates returns scanningGuids with one guid that never resolves.
-  -- FirePendingAfterCallbacks() simulates 4-second window expiry.
-  -- scanningGuids must be cleared; popup opens with whatever candidates confirmed.
-  -- Popup_RemoveCandidate must NOT be called (popup was never opened for this item).
+function TestLoot:test_window_expiry_falls_back_to_snapshot()
+  -- A candidate that never returns a fresh INSPECT_READY within the scanning
+  -- window is resolved against its RETAINED gear snapshot at window expiry (H2)
+  -- rather than dropped. Druid chest 460 vs drop 480 → delta 20 → included.
   _mockIsInInstance = { true, "party" }
   _mockIsInGroup    = true
 
   local guid = "Player-0-UnresolvedGuid"
   mockMemberGear(guid, "party1", "DRUID", 103, { [5] = 460 })
   _mockGuids["player"] = "GUID-SELF"
-  -- Player must NOT self-upgrade: set chest at drop ilvl so delta=0 < threshold.
+  -- Player must NOT self-upgrade: chest at drop ilvl so delta=0 < threshold.
   _mockGearLinks["player"] = { [5] = "item:player_timer_chest" }
   _mockIlvl["item:player_timer_chest"] = 480
 
   local link = "item:timer_test_chest"
   mockItem(link, { "Chest", nil, 4, 480, nil, "Armor", "Leather", nil, "INVTYPE_CHEST", nil, nil, 4, 2, 0 })
 
-  local removeArgs = {}
-  LIF.Popup_RemoveCandidate = function(g, itemLink)
-    table.insert(removeArgs, { guid = g, itemLink = itemLink })
+  local showPopupArgs = nil
+  LIF.ShowPopup = function(itemData, candidates)
+    showPopupArgs = { itemData = itemData, candidates = candidates }
   end
 
   if LIF.OnPlayerLootReceived == nil then
@@ -1194,27 +1050,292 @@ function TestLoot:test_four_second_timer_drops_unresolved_scanning_guids()
   end
 
   LIF.OnPlayerLootReceived(link, 99992)
-  -- Fire the 0-frame tradeability defer → IsItemTradeable true → entry added, 4s timer queued.
-  FirePendingAfterCallbacks()
+  FirePendingAfterCallbacks()  -- 0-frame defer → entry added, window timer queued
 
-  lu.assertEquals(#LIF.pendingLootItems, 1,
-    "Precondition: one pending loot entry must exist before timer fires")
+  lu.assertEquals(#LIF.pendingLootItems, 1, "Precondition: one pending loot entry")
   local entry = LIF.pendingLootItems[1]
-  lu.assertNotNil(entry.scanningGuids, "entry.scanningGuids must exist before timer")
+  lu.assertNil(showPopupArgs,
+    "Popup must NOT open before the window expires (member still scannable, awaiting fresh data)")
 
-  -- Fire the 4-second cleanup timer.
-  FirePendingAfterCallbacks()
+  FirePendingAfterCallbacks()  -- window expiry → snapshot fallback → popup opens
 
-  -- Popup_RemoveCandidate must NOT be called — popup was never opened, nothing to remove.
-  lu.assertEquals(#removeArgs, 0,
-    "Popup_RemoveCandidate must NOT fire on timer expiry (popup was never opened)")
-  -- scanningGuids must be cleared after timer fires.
+  lu.assertNotNil(showPopupArgs, "Popup must open at window expiry via snapshot fallback")
+  lu.assertEquals(#showPopupArgs.candidates, 1, "Fallback must INCLUDE the unresolved member (not drop it)")
+  lu.assertEquals(showPopupArgs.candidates[1].guid, guid, "Included candidate must be the druid")
   local remaining = 0
   for _ in pairs(entry.scanningGuids) do remaining = remaining + 1 end
-  lu.assertEquals(remaining, 0,
-    "entry.scanningGuids must be empty after 4-second window timer fires")
+  lu.assertEquals(remaining, 0, "scanningGuids must be empty after the window timer fires")
 
-  LIF.Popup_RemoveCandidate = nil
+  LIF.ShowPopup = _origShowPopup
+end
+
+-- ============================================================
+-- Cache-fallback + adaptive window (H2/H3, M11/M12)
+-- ============================================================
+
+-- Shared setup: a group-active instance with the local player present but not a
+-- self-upgrade for the dropped item. Returns nothing; callers add members.
+local function _fallbackTestBase()
+  _mockIsInInstance = { true, "party" }
+  _mockIsInGroup    = true
+  _mockGuids["player"] = "GUID-SELF"
+end
+
+function TestLoot:test_dead_candidate_immediate_fallback_opens_popup()
+  -- A candidate dead at loot time can't be freshly inspected, so it resolves
+  -- against its snapshot IMMEDIATELY (no waiting out the window) and the popup
+  -- opens in the same pipeline pass (H3).
+  _fallbackTestBase()
+  local guid = "Player-0-DeadDruid"
+  mockMemberGear(guid, "party1", "DRUID", 103, { [5] = 460 })
+  _mockIsDeadOrGhost["party1"] = true  -- dead → CanScanUnit false
+
+  _mockGearLinks["player"] = { [5] = "item:player_dead_chest" }
+  _mockIlvl["item:player_dead_chest"] = 480
+  local link = "item:dead_test_chest"
+  mockItem(link, { "Chest", nil, 4, 480, nil, "Armor", "Leather", nil, "INVTYPE_CHEST", nil, nil, 4, 2, 0 })
+
+  local showPopupArgs = nil
+  LIF.ShowPopup = function(itemData, candidates) showPopupArgs = { candidates = candidates } end
+
+  LIF.OnPlayerLootReceived(link, 99801)
+  FirePendingAfterCallbacks()  -- pipeline runs; immediate fallback opens popup within it
+
+  lu.assertNotNil(showPopupArgs, "Dead candidate must fall back immediately and open the popup (no window wait)")
+  lu.assertEquals(#showPopupArgs.candidates, 1, "Dead candidate resolved from snapshot must be included")
+  lu.assertEquals(showPopupArgs.candidates[1].guid, guid, "Included candidate must be the dead druid")
+
+  LIF.ShowPopup = _origShowPopup
+end
+
+function TestLoot:test_player_dead_all_candidates_immediate_fallback()
+  -- If the LOCAL player is dead the whole inspect queue is stalled (CanScanUnit
+  -- returns false for everyone), so all candidates fall back immediately rather
+  -- than waiting out a window that could never produce fresh data.
+  _fallbackTestBase()
+  _mockIsDeadOrGhost["player"] = true  -- stalls all inspects
+
+  local dg = "Player-0-PDDruid"
+  local rg = "Player-0-PDRogue"
+  mockMemberGear(dg, "party1", "DRUID", 103, { [11] = 475, [12] = 480 })  -- lower 475
+  mockMemberGear(rg, "party2", "ROGUE", 260, { [11] = 482, [12] = 490 })  -- lower 482
+
+  _mockGearLinks["player"] = { [11] = "item:pd_r1", [12] = "item:pd_r2" }
+  _mockIlvl["item:pd_r1"] = 500
+  _mockIlvl["item:pd_r2"] = 500
+  local link = "item:pd_ring"
+  mockItem(link, { "Ring", nil, 4, 500, nil, "Armor", "Miscellaneous", nil, "INVTYPE_FINGER", nil, nil, 4, 0, 0 })
+
+  local showPopupArgs = nil
+  LIF.ShowPopup = function(itemData, candidates) showPopupArgs = { candidates = candidates } end
+
+  LIF.OnPlayerLootReceived(link, 99802)
+  FirePendingAfterCallbacks()
+
+  lu.assertNotNil(showPopupArgs, "Player dead: candidates must fall back immediately")
+  lu.assertEquals(#showPopupArgs.candidates, 2, "Both members must be included via snapshot fallback")
+
+  LIF.ShowPopup = _origShowPopup
+end
+
+function TestLoot:test_offline_candidate_immediate_fallback()
+  -- A disconnected candidate can't be inspected (CanScanUnit → UnitIsConnected),
+  -- so it falls back immediately like a dead one.
+  _fallbackTestBase()
+  local guid = "Player-0-OfflineDruid"
+  mockMemberGear(guid, "party1", "DRUID", 103, { [5] = 455 })
+  _mockIsConnected["party1"] = false  -- offline
+
+  _mockGearLinks["player"] = { [5] = "item:player_off_chest" }
+  _mockIlvl["item:player_off_chest"] = 480
+  local link = "item:off_test_chest"
+  mockItem(link, { "Chest", nil, 4, 480, nil, "Armor", "Leather", nil, "INVTYPE_CHEST", nil, nil, 4, 2, 0 })
+
+  local showPopupArgs = nil
+  LIF.ShowPopup = function(itemData, candidates) showPopupArgs = { candidates = candidates } end
+
+  LIF.OnPlayerLootReceived(link, 99803)
+  FirePendingAfterCallbacks()
+
+  lu.assertNotNil(showPopupArgs, "Offline candidate must fall back immediately")
+  lu.assertEquals(#showPopupArgs.candidates, 1, "Offline candidate resolved from snapshot must be included")
+
+  LIF.ShowPopup = _origShowPopup
+end
+
+function TestLoot:test_no_snapshot_candidate_dropped()
+  -- A candidate that was never successfully scanned (no gear snapshot) AND can't
+  -- be scanned now (dead) has nothing to fall back on — dropped, no popup.
+  _fallbackTestBase()
+  local guid = "Player-0-NeverScanned"
+  LIF.Cache.Add(guid)  -- PENDING, no gear, never SetComplete
+  _mockGuids["party1"] = guid
+  _mockUnitClass["party1"] = { "Druid", "DRUID" }
+  _mockIsDeadOrGhost["party1"] = true
+
+  _mockGearLinks["player"] = { [5] = "item:player_ns_chest" }
+  _mockIlvl["item:player_ns_chest"] = 480
+  local link = "item:ns_test_chest"
+  mockItem(link, { "Chest", nil, 4, 480, nil, "Armor", "Leather", nil, "INVTYPE_CHEST", nil, nil, 4, 2, 0 })
+
+  local showPopupArgs = nil
+  LIF.ShowPopup = function(itemData, candidates) showPopupArgs = { candidates = candidates } end
+
+  LIF.OnPlayerLootReceived(link, 99804)
+  FirePendingAfterCallbacks()
+
+  lu.assertNil(showPopupArgs, "No snapshot + can't scan → member dropped, no popup opens")
+
+  LIF.ShowPopup = _origShowPopup
+end
+
+function TestLoot:test_late_fresh_inspect_after_fallback_no_double_open()
+  -- After a dead candidate falls back and the popup opens, a late fresh
+  -- INSPECT_READY for the same member must NOT re-open the popup or double-add
+  -- (idempotency): they're no longer in scanningGuids.
+  _fallbackTestBase()
+  local guid = "Player-0-LateFresh"
+  mockMemberGear(guid, "party1", "DRUID", 103, { [5] = 460 })
+  _mockIsDeadOrGhost["party1"] = true
+
+  _mockGearLinks["player"] = { [5] = "item:player_lf_chest" }
+  _mockIlvl["item:player_lf_chest"] = 480
+  local link = "item:lf_test_chest"
+  mockItem(link, { "Chest", nil, 4, 480, nil, "Armor", "Leather", nil, "INVTYPE_CHEST", nil, nil, 4, 2, 0 })
+
+  local showPopupCount = 0
+  LIF.ShowPopup = function() showPopupCount = showPopupCount + 1 end
+
+  LIF.OnPlayerLootReceived(link, 99805)
+  FirePendingAfterCallbacks()  -- immediate fallback opens popup
+  lu.assertEquals(showPopupCount, 1, "Popup opens once via fallback")
+
+  -- Member revives and completes a fresh inspect while the entry is still pending.
+  _mockIsDeadOrGhost["party1"] = false
+  LIF.Cache.SetComplete(guid, { gear = { [5] = { link = "x", ilvl = 470 } }, specID = 103 })
+  LIF.OnLootInspectReady(guid)
+
+  lu.assertEquals(showPopupCount, 1,
+    "Late fresh inspect must NOT re-open the popup (guid already left scanningGuids)")
+
+  LIF.ShowPopup = _origShowPopup
+end
+
+function TestLoot:test_adaptive_window_sizes_by_candidate_count()
+  -- Window = min(BASE + N*PER, MAX) = min(2 + N*3, 15). 1 candidate → 5s; a full
+  -- 4-candidate party → 14s. Members stay scannable (alive) so none fall back
+  -- immediately and all count toward the window.
+  _fallbackTestBase()
+  for i = 1, 4 do
+    local g = "Player-0-Win" .. i
+    mockMemberGear(g, "party" .. i, "DRUID", 103, { [11] = 470, [12] = 470 })
+  end
+  _mockGearLinks["player"] = { [11] = "item:win_r1", [12] = "item:win_r2" }
+  _mockIlvl["item:win_r1"] = 500
+  _mockIlvl["item:win_r2"] = 500
+  local link = "item:win_ring"
+  mockItem(link, { "Ring", nil, 4, 500, nil, "Armor", "Miscellaneous", nil, "INVTYPE_FINGER", nil, nil, 4, 0, 0 })
+
+  LIF.OnPlayerLootReceived(link, 99806)
+  FirePendingAfterCallbacks()
+
+  lu.assertEquals(#LIF.pendingLootItems, 1, "Precondition: one pending entry")
+  lu.assertEquals(LIF.pendingLootItems[1].window, 14,
+    "4 scannable candidates → window = min(2 + 4*3, 15) = 14s")
+end
+
+function TestLoot:test_departed_confirmed_candidate_cleared_on_roster_update()
+  -- M11: a member confirmed into an entry (but the popup not yet opened) who then
+  -- leaves the group must be removed from confirmedCandidates, so the popup can't
+  -- render a row for someone who's gone.
+  _fallbackTestBase()
+  local leavingGuid = "Player-0-Leaver"
+  local stayingGuid = "Player-0-Stayer"
+  mockMemberGear(leavingGuid, "party1", "DRUID", 103, { [5] = 460 })
+  mockMemberGear(stayingGuid, "party2", "ROGUE", 260, { [5] = 460 })
+
+  -- Entry with the leaver already confirmed, still waiting on the stayer's scan.
+  local entry = {
+    itemData = { link = "item:m11", ilvl = 480, slotIDs = { 5 }, slotCategory = "armor" },
+    scanningGuids = { [stayingGuid] = true },
+    confirmedCandidates = { [leavingGuid] = { guid = leavingGuid } },
+    popupOpened = false,
+  }
+  LIF.pendingLootItems = { entry }
+
+  -- Leaver drops out of the roster; stayer remains.
+  _mockGuids["party1"] = nil
+  _mockExists["party1"] = false
+  LIF.OnGroupRosterUpdate()
+
+  lu.assertNil(entry.confirmedCandidates[leavingGuid],
+    "Departed member must be cleared from confirmedCandidates (M11)")
+end
+
+function TestLoot:test_departure_unblocks_popup_immediately()
+  -- 3 candidates: one already confirmed, two still scanning. When the two
+  -- scanning members leave the group, the entry is unblocked and the popup opens
+  -- immediately (with the confirmed one) instead of waiting out the window.
+  _fallbackTestBase()
+  local a = "Player-0-DepA"  -- confirmed, stays
+  local b = "Player-0-DepB"  -- scanning, leaves
+  local c = "Player-0-DepC"  -- scanning, leaves
+  mockMemberGear(a, "party1", "DRUID", 103, { [5] = 460 })
+  mockMemberGear(b, "party2", "ROGUE", 260, { [5] = 460 })
+  mockMemberGear(c, "party3", "MONK",  268, { [5] = 460 })
+
+  local entry = {
+    itemData = { link = "item:dep", name = "Dep", ilvl = 480, slotIDs = { 5 }, slotCategory = "armor" },
+    scanningGuids = { [b] = true, [c] = true },
+    confirmedCandidates = { [a] = { guid = a, unit = "party1", delta = 20 } },
+    popupOpened = false,
+    cancelled = false,
+  }
+  LIF.pendingLootItems = { entry }
+
+  local showPopupArgs = nil
+  LIF.ShowPopup = function(itemData, candidates) showPopupArgs = { candidates = candidates } end
+
+  -- B and C drop out of the roster; A remains.
+  _mockGuids["party2"] = nil; _mockExists["party2"] = false
+  _mockGuids["party3"] = nil; _mockExists["party3"] = false
+  LIF.OnGroupRosterUpdate()
+
+  lu.assertNotNil(showPopupArgs, "Popup must open once the leavers unblock the entry")
+  lu.assertEquals(#showPopupArgs.candidates, 1, "Only the confirmed member remains")
+  lu.assertEquals(showPopupArgs.candidates[1].guid, a, "The confirmed druid is shown")
+  lu.assertEquals(next(entry.scanningGuids), nil, "scanningGuids must be empty after both leavers cleared")
+
+  LIF.ShowPopup = _origShowPopup
+end
+
+function TestLoot:test_loot_reset_cancels_pending_entries_and_neutralizes_timer()
+  -- M12: leaving the group / going inactive must clear pending loot state so a
+  -- surviving window timer can't open a popup for a group that's gone.
+  _fallbackTestBase()
+  local guid = "Player-0-ResetDruid"
+  mockMemberGear(guid, "party1", "DRUID", 103, { [5] = 460 })
+  _mockGearLinks["player"] = { [5] = "item:player_reset_chest" }
+  _mockIlvl["item:player_reset_chest"] = 480
+  local link = "item:reset_test_chest"
+  mockItem(link, { "Chest", nil, 4, 480, nil, "Armor", "Leather", nil, "INVTYPE_CHEST", nil, nil, 4, 2, 0 })
+
+  local showPopupCount = 0
+  LIF.ShowPopup = function() showPopupCount = showPopupCount + 1 end
+
+  LIF.OnPlayerLootReceived(link, 99807)
+  FirePendingAfterCallbacks()  -- entry + window timer queued (member alive → no immediate)
+  local entry = LIF.pendingLootItems[1]
+  lu.assertNotNil(entry, "Precondition: a pending entry exists")
+
+  LIF.Loot_Reset()
+  lu.assertEquals(#LIF.pendingLootItems, 0, "Loot_Reset must clear pendingLootItems")
+  lu.assertTrue(entry.cancelled, "Loot_Reset must mark the entry cancelled")
+
+  FirePendingAfterCallbacks()  -- fire the now-orphaned window timer
+  lu.assertEquals(showPopupCount, 0, "A cancelled entry's surviving timer must NOT open a popup")
+
+  LIF.ShowPopup = _origShowPopup
 end
 
 function TestLoot:test_multiple_loot_events_append()
@@ -1248,22 +1369,18 @@ function TestLoot:test_multiple_loot_events_append()
     "Two OnPlayerLootReceived calls must append two entries (no overwrite)")
 end
 
-function TestLoot:test_popup_stubs_are_callable()
-  -- LIF.ShowPopup, LIF.Popup_UpdateCandidate, LIF.Popup_RemoveCandidate
-  -- must exist as callable no-ops and not raise errors with any arg combination.
-  if LIF.ShowPopup == nil or LIF.Popup_UpdateCandidate == nil or LIF.Popup_RemoveCandidate == nil then
-    lu.skip("Popup stubs not yet implemented (Plan 03-05 Task 1)")
+function TestLoot:test_popup_stub_is_callable()
+  -- LIF.ShowPopup must exist as a callable no-op and not raise on any arg combo
+  -- (the loot pipeline runs headless in tests / before ui/popup.lua loads).
+  if LIF.ShowPopup == nil then
+    lu.skip("ShowPopup stub not yet implemented (Plan 03-05 Task 1)")
   end
 
   -- No errors on any combination including nil args.
   LIF.ShowPopup({ link = "item:stub_test" }, {})
   LIF.ShowPopup(nil, nil)
-  LIF.Popup_UpdateCandidate("Player-0-Fake", {}, "item:stub_link")
-  LIF.Popup_UpdateCandidate(nil, nil, nil)
-  LIF.Popup_RemoveCandidate("Player-0-Fake", "item:stub_link")
-  LIF.Popup_RemoveCandidate(nil, nil)
 
-  lu.assertTrue(true, "All popup stubs callable without error")
+  lu.assertTrue(true, "ShowPopup stub callable without error")
 end
 
 function TestLoot:test_pending_loot_entry_has_popup_opened_false()
@@ -1474,92 +1591,6 @@ function TestLoot:test_heirloom_player_ring_one_slot_heirloom_uses_other()
   lu.assertTrue(result, "Slot 11 heirloom (huge), slot 12 plain 300 → comparison uses slot 12 → upgrade (SC3)")
 end
 
-function TestLoot:test_heirloom_candidate_armor_excluded()
-  -- SC2: candidate wears heirloom chest at level 50 → excluded from eligibility.
-  -- Popup_RemoveCandidate must be invoked.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local heirloomLink = "item:22201"
-  _mockHeirloomItemIDs[22201] = true
-  _mockUnitLevel["party1"] = 50
-
-  local guid = "Player-0-HeirloomCandidate"
-  _mockGuids["party1"] = guid
-  _mockUnitClass["party1"] = { "Druid", "DRUID" }
-  _mockGuids["player"] = "GUID-SELF"
-  LIF.Cache.Add(guid)
-  LIF.Cache.SetComplete(guid, {
-    gear  = { [5] = { link = heirloomLink, ilvl = 300 } },
-    specID = 103,
-  })
-
-  local removeCalls = {}
-  LIF.Popup_RemoveCandidate = function(g, itemLink)
-    table.insert(removeCalls, { guid = g, itemLink = itemLink })
-  end
-
-  local chestItemData = { link = "item:22202", ilvl = 400,
-                           slotIDs = {5}, slotCategory = "armor", armorType = "Leather" }
-  table.insert(LIF.pendingLootItems, {
-    itemData            = chestItemData,
-    t                   = 0,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#removeCalls >= 1,
-    "Heirloom-wearing candidate at level 50 must be excluded — RemoveCandidate called (SC2)")
-
-  LIF.Popup_RemoveCandidate = nil
-end
-
-function TestLoot:test_heirloom_candidate_nil_slot_falls_through()
-  -- SC4 (candidate side): candidate's gear is empty (nil slots); heirloom check skipped.
-  -- nil=0 path applies; drop ilvl 400 vs 0 → eligible → Popup_UpdateCandidate called.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  _mockUnitLevel["party1"] = 50
-
-  local guid = "Player-0-NilSlotCandidate"
-  _mockGuids["party1"] = guid
-  _mockUnitClass["party1"] = { "Druid", "DRUID" }
-  _mockGuids["player"] = "GUID-SELF"
-  LIF.Cache.Add(guid)
-  LIF.Cache.SetComplete(guid, {
-    gear  = {},  -- no gear entries at all
-    specID = 103,
-  })
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g, data = data, itemLink = itemLink })
-  end
-
-  local chestItemData = { link = "item:22203", ilvl = 400,
-                           slotIDs = {5}, slotCategory = "armor", armorType = "Leather" }
-  table.insert(LIF.pendingLootItems, {
-    itemData            = chestItemData,
-    t                   = 0,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#updateCalls >= 1,
-    "Nil candidate slot falls through to nil=0 path → eligible → UpdateCandidate called (SC4 candidate)")
-
-  LIF.Popup_UpdateCandidate = nil
-end
-
 function TestLoot:test_heirloom_guard_c_heirloom_missing()
   -- D-02 guard: C_Heirloom = nil → isHeirloomActive returns false → normal delta path applies.
   -- With C_Heirloom absent, player wearing "heirloom" at level 50 is treated as non-heirloom.
@@ -1643,105 +1674,45 @@ function TestLoot:test_heirloom_debug_bypass_inactive_when_debug_off()
 end
 
 -- ============================================================
--- Phase 5: minPartySize gate (SC6)
+-- AUD-009: minPartySize disables the addon below threshold.
+-- The gate moved out of _tryOpenPopup into ShouldBeActive() via the pure helper
+-- LIF.GroupMeetsMinPartySize(); these test the helper directly (ShouldBeActive
+-- itself lives in the un-harnessed entry file). Bidirectional activation is driven
+-- by the existing GROUP_ROSTER_UPDATE re-eval, not tested here.
 -- ============================================================
 
--- Shared setup: one Druid party member, Leather chest drop at ilvl 300 (member has 200 → delta 100).
-local function _setupMinPartySizeEntry()
-  local guid = "Player-0-MinPartySizeTest"
-  local dropLink = "item:minparty_chest"
-  mockItem(dropLink, { "GateChest", nil, 4, 300, nil, "Armor", "Leather", nil, "INVTYPE_CHEST", nil, nil, 4, 2, 0 })
-  mockMemberGear(guid, "party1", "DRUID", 103, { [5] = 200 })
-  _mockGuids["player"] = "GUID-SELF"
-  table.insert(LIF.pendingLootItems, {
-    itemData            = { link = dropLink, ilvl = 300, slotID = 5, slotIDs = {5},
-                            slotCategory = "armor", equipLoc = "INVTYPE_CHEST",
-                            itype = "Armor", subtype = "Leather", armorType = "Leather" },
-    t                   = 0,
-    threshold           = 1,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = false,
-  })
-  return guid
-end
-
-function TestLoot:test_min_party_size_suppresses_popup_when_group_too_small()
-  if LIF.OnLootInspectReady == nil then lu.skip("LIF.OnLootInspectReady not yet implemented") end
-  local origGlobal = LootItForward
-  local origGroupSize = _mockGroupSize
-  LootItForward = { db = { profile = { minPartySize = 5 }, char = { debugMode = false } } }
+function TestLoot:test_group_meets_min_party_size_false_when_below_threshold()
+  local origGlobal, origGroupSize = LootItForward, _mockGroupSize
+  LootItForward = { db = { profile = { minPartySize = 5 } } }
   _mockGroupSize = 2
-
-  local fired = false
-  LIF.ShowPopup = function() fired = true end
-
-  LIF.OnLootInspectReady(_setupMinPartySizeEntry())
-
-  lu.assertFalse(fired, "minPartySize=5 with groupSize=2 must suppress popup")
-
-  LootItForward = origGlobal
-  _mockGroupSize = origGroupSize
-  LIF.ShowPopup = _origShowPopup
+  lu.assertFalse(LIF.GroupMeetsMinPartySize(), "groupSize 2 < minPartySize 5 → false")
+  LootItForward, _mockGroupSize = origGlobal, origGroupSize
 end
 
-function TestLoot:test_min_party_size_allows_popup_when_group_meets_minimum()
-  if LIF.OnLootInspectReady == nil then lu.skip("LIF.OnLootInspectReady not yet implemented") end
-  local origGlobal = LootItForward
-  local origGroupSize = _mockGroupSize
-  LootItForward = { db = { profile = { minPartySize = 2 }, char = { debugMode = false } } }
+function TestLoot:test_group_meets_min_party_size_true_when_at_threshold()
+  local origGlobal, origGroupSize = LootItForward, _mockGroupSize
+  LootItForward = { db = { profile = { minPartySize = 2 } } }
   _mockGroupSize = 2
-
-  local fired = false
-  LIF.ShowPopup = function() fired = true end
-
-  LIF.OnLootInspectReady(_setupMinPartySizeEntry())
-
-  lu.assertTrue(fired, "minPartySize=2 with groupSize=2 must allow popup")
-
-  LootItForward = origGlobal
-  _mockGroupSize = origGroupSize
-  LIF.ShowPopup = _origShowPopup
+  lu.assertTrue(LIF.GroupMeetsMinPartySize(), "groupSize 2 >= minPartySize 2 → true")
+  LootItForward, _mockGroupSize = origGlobal, origGroupSize
 end
 
-function TestLoot:test_min_party_size_bypassed_when_groupsize_zero()
-  -- groupSize=0 means the offline/test harness — gate is intentionally skipped.
-  if LIF.OnLootInspectReady == nil then lu.skip("LIF.OnLootInspectReady not yet implemented") end
-  local origGlobal = LootItForward
-  local origGroupSize = _mockGroupSize
-  LootItForward = { db = { profile = { minPartySize = 5 }, char = { debugMode = false } } }
-  _mockGroupSize = 0
-
-  local fired = false
-  LIF.ShowPopup = function() fired = true end
-
-  LIF.OnLootInspectReady(_setupMinPartySizeEntry())
-
-  lu.assertTrue(fired, "groupSize=0 (offline) must bypass minPartySize gate")
-
-  LootItForward = origGlobal
-  _mockGroupSize = origGroupSize
-  LIF.ShowPopup = _origShowPopup
+function TestLoot:test_group_meets_min_party_size_true_when_above_threshold()
+  local origGlobal, origGroupSize = LootItForward, _mockGroupSize
+  LootItForward = { db = { profile = { minPartySize = 2 } } }
+  _mockGroupSize = 5
+  lu.assertTrue(LIF.GroupMeetsMinPartySize(), "groupSize 5 >= minPartySize 2 → true")
+  LootItForward, _mockGroupSize = origGlobal, origGroupSize
 end
 
-function TestLoot:test_min_party_size_defaults_to_2_when_absent()
-  -- minPartySize key absent from profile → default 2; groupSize=2 → popup fires.
-  if LIF.OnLootInspectReady == nil then lu.skip("LIF.OnLootInspectReady not yet implemented") end
-  local origGlobal = LootItForward
-  local origGroupSize = _mockGroupSize
-  LootItForward = { db = { profile = {}, char = { debugMode = false } } }
+function TestLoot:test_group_meets_min_party_size_defaults_to_2_when_absent()
+  local origGlobal, origGroupSize = LootItForward, _mockGroupSize
+  LootItForward = { db = { profile = {} } }
   _mockGroupSize = 2
-
-  local fired = false
-  LIF.ShowPopup = function() fired = true end
-
-  LIF.OnLootInspectReady(_setupMinPartySizeEntry())
-
-  lu.assertTrue(fired, "minPartySize absent → defaults to 2; groupSize=2 must allow popup")
-
-  LootItForward = origGlobal
-  _mockGroupSize = origGroupSize
-  LIF.ShowPopup = _origShowPopup
+  lu.assertTrue(LIF.GroupMeetsMinPartySize(), "absent setting → default 2; groupSize 2 → true")
+  _mockGroupSize = 1
+  lu.assertFalse(LIF.GroupMeetsMinPartySize(), "absent setting → default 2; groupSize 1 → false")
+  LootItForward, _mockGroupSize = origGlobal, origGroupSize
 end
 
 -- ============================================================
@@ -1774,164 +1745,7 @@ function TestLoot:test_get_slot_category_weaponoffhand_is_weapon()
     "GetSlotCategory: INVTYPE_WEAPONOFFHAND must return 'weapon' (classID=2 path)")
 end
 
--- ---------- Warglaive false positive / true positive (Bug A, cases 1/2) ----------
-
-function TestLoot:test_warglaive_shaman_ineligible()
-  -- Warglaive (subID=9, DEMONHUNTER only) — Shaman must NOT be eligible.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-ShamanWarglaive"
-  -- Shaman specID=263 (Enhancement, AGI); slot 16 lower than drop
-  mockMemberGear(guid, "party1", "SHAMAN", 263, { [16] = 450 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  local removeCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g })
-  end
-  LIF.Popup_RemoveCandidate = function(g, itemLink)
-    table.insert(removeCalls, { guid = g })
-  end
-
-  -- Warglaive: classID=2, subID=9, equipLoc=INVTYPE_WEAPON, primaryStat=INT
-  local warglaiveLink = "item:warglaive_bug_a"
-  mockItem(warglaiveLink, { "Warglaive of Azzinoth", nil, 4, 470, nil,
-    "Weapon", "Warglaives", nil, "INVTYPE_WEAPON", nil, nil, 2, 9, 0 })
-  _mockItemStats[warglaiveLink] = { ITEM_MOD_INTELLECT_SHORT = 200 }
-
-  local itemData = {
-    link         = warglaiveLink,
-    ilvl         = 470,
-    equipLoc     = "INVTYPE_WEAPON",
-    classID      = 2,
-    subID        = 9,
-    slotIDs      = {16},
-    slotCategory = "weapon",
-    weaponSubID  = 9,
-    primaryStats  = { INT = true },
-  }
-
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 10,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertEquals(#updateCalls, 0,
-    "Shaman must NOT be eligible for warglaive (classID=2, subID=9 restricted to DEMONHUNTER)")
-
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-  LIF.Popup_RemoveCandidate = _origPopupRemoveCand
-end
-
-function TestLoot:test_warglaive_demonhunter_eligible()
-  -- Warglaive (subID=9) — Devourer DH (specID=1480, INT) with slot 16 lower than drop → eligible.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-DHWarglaive"
-  -- Devourer DH specID=1480 (INT per character_data.lua); slot 16 at 450 < drop 470
-  mockMemberGear(guid, "party1", "DEMONHUNTER", 1480, { [16] = 450 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g, data = data })
-  end
-
-  local warglaiveLink = "item:warglaive_dh_true"
-  mockItem(warglaiveLink, { "Warglaive of Azzinoth", nil, 4, 470, nil,
-    "Weapon", "Warglaives", nil, "INVTYPE_WEAPON", nil, nil, 2, 9, 0 })
-  _mockItemStats[warglaiveLink] = { ITEM_MOD_INTELLECT_SHORT = 200 }
-
-  local itemData = {
-    link         = warglaiveLink,
-    ilvl         = 470,
-    equipLoc     = "INVTYPE_WEAPON",
-    classID      = 2,
-    subID        = 9,
-    slotIDs      = {16},
-    slotCategory = "weapon",
-    weaponSubID  = 9,
-    primaryStats  = { INT = true },
-  }
-
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 10,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#updateCalls >= 1,
-    "Devourer DH must be eligible for warglaive (INT stat match, subID=9 allows DEMONHUNTER)")
-
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-end
-
 -- ---------- Unknown weapon subID (D-03, case 13) ----------
-
-function TestLoot:test_unknown_weapon_subid_member_ineligible()
-  -- subID=99 is not in ITEM_CLASS_RESTRICT[2] → D-03 fail-safe → ineligible.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-UnknownSubID"
-  mockMemberGear(guid, "party1", "WARRIOR", 72, { [16] = 450 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g })
-  end
-
-  local unknownLink = "item:unknown_weapon_subid"
-  mockItem(unknownLink, { "UnknownWeapon", nil, 4, 470, nil,
-    "Weapon", "Unknown", nil, "INVTYPE_WEAPON", nil, nil, 2, 99, 0 })
-  _mockItemStats[unknownLink] = { ITEM_MOD_AGILITY_SHORT = 150 }
-
-  local itemData = {
-    link         = unknownLink,
-    ilvl         = 470,
-    equipLoc     = "INVTYPE_WEAPON",
-    classID      = 2,
-    subID        = 99,
-    slotIDs      = {16},
-    slotCategory = "weapon",
-    weaponSubID  = 99,
-    primaryStats  = { AGI = true },
-  }
-
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 10,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertEquals(#updateCalls, 0,
-    "Unknown weapon subID=99 must be excluded (D-03 fail-safe: unknown subID → skip)")
-
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-end
 
 function TestLoot:test_unknown_weapon_subid_self_check_false()
   -- callIsPlayerUpgrade with subID=99 weapon → D-03 → returns false.
@@ -2079,504 +1893,40 @@ function TestLoot:test_self_check_offhand_beats_2h_is_self_upgrade()
     "a holdable out-ilvling the equipped 2H is a self-upgrade (1H+holdable reconfigure)")
 end
 
+function TestLoot:test_self_upgrade_returns_real_basis_not_min()
+  -- L1: the self-upgrade delta shown in chat must use the SAME basis the decision
+  -- used. Ele Shaman on 1H @200 + off-hand @180 → a 2H is judged against the
+  -- AVERAGE (190), not math.min(200,180)=180. IsPlayerUpgrade must SURFACE 190 as
+  -- its basis so the "+X ilvl" line reads +5 (matching the decision), not +15.
+  _mockGuids["player"] = "GUID-SELF"
+  _mockUnitClass["player"] = { "Shaman", "SHAMAN" }
+  _mockGetSpecialization = 1
+  _mockSpecializationInfo[1] = 262  -- Elemental
+  local mh, oh = "item:self_mh1h_l1", "item:self_oh_l1"
+  _mockItemInfo[mh] = { "OneHandMace", nil, 4, 200, nil, "Weapon", "Maces", nil, "INVTYPE_WEAPON", nil, nil, 2, 4, 0 }
+  _mockItemInfo[oh] = { "OffHand", nil, 4, 180, nil, "Armor", "Miscellaneous", nil, "INVTYPE_HOLDABLE", nil, nil, 4, 0, 0 }
+  _mockIlvl[mh] = 200
+  _mockIlvl[oh] = 180
+  _mockGearLinks["player"] = { [16] = mh, [17] = oh }
+
+  local drop = { link = "item:self_2h195_l1", ilvl = 195, equipLoc = "INVTYPE_2HWEAPON",
+                 classID = 2, subID = 10, slotCategory = "weapon", slotIDs = {16}, weaponSubID = 10 }
+
+  local ok, basis = callIsPlayerUpgrade(drop, 1)
+  lu.assertTrue(ok, "2H @195 beats the 1H+off-hand average (190) → self-upgrade")
+  lu.assertEquals(basis, 190,
+    "self-upgrade basis must be the pair-average the decision used, not math.min(200,180)")
+end
+
 -- ============================================================
 -- Phase 06.1 Plan 04: Offhand eligibility, 2H gate, Fury Warrior dual-slot
 -- ============================================================
-
--- ---------- Offhand class gate — holdable (case 5) ----------
-
-function TestLoot:test_offhand_holdable_warlock_eligible()
-  -- Holdable drop, WARLOCK member with slot 17 lower by ≥ threshold → eligible.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-WarlockHoldable"
-  -- WARLOCK specID=265 (Affliction, INT); slot 17 = 450 (no slot 16 equipped)
-  mockMemberGear(guid, "party1", "WARLOCK", 265, { [17] = 450 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g, data = data })
-  end
-
-  local holdableLink = "item:holdable_warlock_elig"
-  mockItem(holdableLink, { "Luminescent Sprout", nil, 4, 470, nil,
-    "Armor", "Miscellaneous", nil, "INVTYPE_HOLDABLE", nil, nil, 4, 0, 0 })
-
-  local itemData = {
-    link         = holdableLink,
-    ilvl         = 470,
-    equipLoc     = "INVTYPE_HOLDABLE",
-    classID      = 4,
-    subID        = 0,
-    slotIDs      = {17},
-    slotCategory = "offhand",
-    offhandSubID = 0,
-  }
-
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 10,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#updateCalls >= 1,
-    "WARLOCK must be eligible for holdable drop (Warlock offHandItem includes holdable(0), delta 20 >= 10)")
-
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-end
-
-function TestLoot:test_offhand_holdable_warrior_ineligible()
-  -- Holdable drop, WARRIOR member → ineligible (WARRIOR not in holdable allow-set).
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-WarriorHoldable"
-  -- WARRIOR specID=71 (Arms); slot 17 = 450
-  mockMemberGear(guid, "party1", "WARRIOR", 71, { [17] = 450 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g })
-  end
-
-  local holdableLink = "item:holdable_warrior_inelig"
-  mockItem(holdableLink, { "Luminescent Sprout", nil, 4, 470, nil,
-    "Armor", "Miscellaneous", nil, "INVTYPE_HOLDABLE", nil, nil, 4, 0, 0 })
-
-  local itemData = {
-    link         = holdableLink,
-    ilvl         = 470,
-    equipLoc     = "INVTYPE_HOLDABLE",
-    classID      = 4,
-    subID        = 0,
-    slotIDs      = {17},
-    slotCategory = "offhand",
-    offhandSubID = 0,
-  }
-
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 10,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertEquals(#updateCalls, 0,
-    "WARRIOR must NOT be eligible for holdable drop (no Warrior spec has holdable in offHandItem)")
-
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-end
-
--- ---------- Offhand class gate — shield (case 6) ----------
-
-function TestLoot:test_offhand_shield_warrior_eligible()
-  -- Shield drop, WARRIOR member with slot 17 lower by ≥ threshold → eligible.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-WarriorShield"
-  -- Protection Warrior specID=73; slot 17 = 450
-  mockMemberGear(guid, "party1", "WARRIOR", 73, { [17] = 450 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g, data = data })
-  end
-
-  local shieldLink = "item:shield_warrior_elig"
-  mockItem(shieldLink, { "FrostForged Shield", nil, 4, 470, nil,
-    "Armor", "Shield", nil, "INVTYPE_SHIELD", nil, nil, 4, 6, 0 })
-
-  local itemData = {
-    link         = shieldLink,
-    ilvl         = 470,
-    equipLoc     = "INVTYPE_SHIELD",
-    classID      = 4,
-    subID        = 6,
-    slotIDs      = {17},
-    slotCategory = "offhand",
-    offhandSubID = 6,
-  }
-
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 10,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#updateCalls >= 1,
-    "WARRIOR must be eligible for shield drop (Warrior offHandItem includes shield(6))")
-
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-end
-
-function TestLoot:test_offhand_shield_mage_ineligible()
-  -- Shield drop, MAGE member → ineligible (MAGE not in shield allow-set).
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-MageShield"
-  -- Fire Mage specID=63; slot 17 = 450
-  mockMemberGear(guid, "party1", "MAGE", 63, { [17] = 450 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g })
-  end
-
-  local shieldLink = "item:shield_mage_inelig"
-  mockItem(shieldLink, { "FrostForged Shield", nil, 4, 470, nil,
-    "Armor", "Shield", nil, "INVTYPE_SHIELD", nil, nil, 4, 6, 0 })
-
-  local itemData = {
-    link         = shieldLink,
-    ilvl         = 470,
-    equipLoc     = "INVTYPE_SHIELD",
-    classID      = 4,
-    subID        = 6,
-    slotIDs      = {17},
-    slotCategory = "offhand",
-    offhandSubID = 6,
-  }
-
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 10,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertEquals(#updateCalls, 0,
-    "MAGE must NOT be eligible for shield drop (no Mage spec has shield(6) in offHandItem)")
-
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-end
-
--- ---------- Offhand ilvl comparison (case 7) ----------
-
-function TestLoot:test_offhand_ilvl_above_threshold_eligible_slotid_17()
-  -- Holdable drop 470, WARLOCK slot 17 = 450, threshold 10 → eligible; candidate slotID=17.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-WarlockIlvl"
-  mockMemberGear(guid, "party1", "WARLOCK", 265, { [17] = 450 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g, data = data })
-  end
-
-  local holdableLink = "item:holdable_ilvl_test"
-  mockItem(holdableLink, { "Luminescent Sprout", nil, 4, 470, nil,
-    "Armor", "Miscellaneous", nil, "INVTYPE_HOLDABLE", nil, nil, 4, 0, 0 })
-
-  local itemData = {
-    link         = holdableLink,
-    ilvl         = 470,
-    equipLoc     = "INVTYPE_HOLDABLE",
-    classID      = 4,
-    subID        = 0,
-    slotIDs      = {17},
-    slotCategory = "offhand",
-    offhandSubID = 0,
-  }
-
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 10,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#updateCalls >= 1,
-    "Holdable drop 470 vs slot 17 ilvl 450, threshold 10 → eligible (delta 20 >= 10)")
-  lu.assertEquals(updateCalls[1].data.slotID, 17,
-    "Eligible offhand candidate must have slotID=17")
-
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-end
-
-function TestLoot:test_offhand_ilvl_below_threshold_ineligible()
-  -- Holdable drop 470, WARLOCK slot 17 = 465, threshold 10 → ineligible (delta 5 < 10).
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-WarlockIlvlLow"
-  mockMemberGear(guid, "party1", "WARLOCK", 265, { [17] = 465 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g })
-  end
-
-  local holdableLink = "item:holdable_ilvl_below"
-  mockItem(holdableLink, { "Luminescent Sprout", nil, 4, 470, nil,
-    "Armor", "Miscellaneous", nil, "INVTYPE_HOLDABLE", nil, nil, 4, 0, 0 })
-
-  local itemData = {
-    link         = holdableLink,
-    ilvl         = 470,
-    equipLoc     = "INVTYPE_HOLDABLE",
-    classID      = 4,
-    subID        = 0,
-    slotIDs      = {17},
-    slotCategory = "offhand",
-    offhandSubID = 0,
-  }
-
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 10,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertEquals(#updateCalls, 0,
-    "Holdable drop 470 vs slot 17 ilvl 465, threshold 10 → ineligible (delta 5 < 10)")
-
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-end
-
--- ---------- 2H gate (cases 8/9) ----------
-
-function TestLoot:test_offhand_vs_2h_member_eligible_straight_across()
-  -- WARLOCK member on a 2H staff @460 (D-16 cross-config): a holdable @470
-  -- out-ilvls the 2H straight across → eligible (they could run 1H+holdable).
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-Warlock2HGate"
-  -- mockMemberGear sets up _mockGearLinks and cache; override slot 16 itemInfo to 2H
-  mockMemberGear(guid, "party1", "WARLOCK", 265, { [16] = 460 })
-  -- Override slot 16 link's ItemInfo so GetItemInfo returns equipLoc="INVTYPE_2HWEAPON"
-  local slot16Link = "item:Player-0-Warlock2HGates16"
-  _mockItemInfo[slot16Link] = { "TwoHandStaff", nil, 4, 460, nil,
-    "Weapon", "Staves", nil, "INVTYPE_2HWEAPON", nil, nil, 2, 10, 0 }
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g })
-  end
-
-  local holdableLink = "item:holdable_2h_gate"
-  mockItem(holdableLink, { "Luminescent Sprout", nil, 4, 470, nil,
-    "Armor", "Miscellaneous", nil, "INVTYPE_HOLDABLE", nil, nil, 4, 0, 0 })
-
-  local itemData = {
-    link         = holdableLink,
-    ilvl         = 470,
-    equipLoc     = "INVTYPE_HOLDABLE",
-    classID      = 4,
-    subID        = 0,
-    slotIDs      = {17},
-    slotCategory = "offhand",
-    offhandSubID = 0,
-  }
-
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 10,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#updateCalls >= 1,
-    "WARLOCK on a 2H @460 must be eligible for a holdable @470 (straight-across cross-config)")
-
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-end
-
-function TestLoot:test_offhand_no_slot16_eligible()
-  -- WARLOCK member with no slot 16 equipped → slot 16 read = nil → no 2H gate → eligible.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-WarlockNoSlot16"
-  -- Only slot 17 populated; slot 16 absent → nil live read → passes 2H gate
-  mockMemberGear(guid, "party1", "WARLOCK", 265, { [17] = 450 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g, data = data })
-  end
-
-  local holdableLink = "item:holdable_no_slot16"
-  mockItem(holdableLink, { "Luminescent Sprout", nil, 4, 470, nil,
-    "Armor", "Miscellaneous", nil, "INVTYPE_HOLDABLE", nil, nil, 4, 0, 0 })
-
-  local itemData = {
-    link         = holdableLink,
-    ilvl         = 470,
-    equipLoc     = "INVTYPE_HOLDABLE",
-    classID      = 4,
-    subID        = 0,
-    slotIDs      = {17},
-    slotCategory = "offhand",
-    offhandSubID = 0,
-  }
-
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 10,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#updateCalls >= 1,
-    "WARLOCK with no slot 16 equipped must be eligible for offhand drop (nil slot 16 → no 2H gate)")
-
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-end
 
 -- ---------- Offhand primary stat gate + heirloom gate (F4) ----------
 -- The offhand branch never gated on primary stats or heirlooms, unlike
 -- ring/trinket/weapon/neck/back. An INT holdable/shield could misread as an
 -- upgrade for a STR or AGI class, and a heirloom-equipped offhand slot was
 -- never excluded the way every other heirloom-bearing slot is.
-
-function TestLoot:test_offhand_stat_mismatch_member_ineligible()
-  -- INT holdable, Retribution Paladin (specID=70, STR). PALADIN is class-
-  -- eligible for holdables, and slot 17 is far below the drop's ilvl, but
-  -- the stat mismatch must still exclude them.
-  local guid = "Player-0-RetPalaHoldable"
-  mockMemberGear(guid, "party1", "PALADIN", 70, { [17] = 100 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g })
-  end
-
-  local holdableLink = "item:holdable_int_statgate"
-  mockItem(holdableLink, { "Luminescent Sprout", nil, 4, 470, nil,
-    "Armor", "Miscellaneous", nil, "INVTYPE_HOLDABLE", nil, nil, 4, 0, 0 })
-
-  local itemData = {
-    link         = holdableLink,
-    ilvl         = 470,
-    equipLoc     = "INVTYPE_HOLDABLE",
-    classID      = 4,
-    subID        = 0,
-    slotIDs      = {17},
-    slotCategory = "offhand",
-    offhandSubID = 0,
-    primaryStats = { INT = true },
-  }
-
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 10,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertEquals(#updateCalls, 0,
-    "Retribution Paladin (STR) must NOT be eligible for an INT holdable, even with a huge ilvl delta")
-
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-end
-
-function TestLoot:test_offhand_stat_match_member_eligible()
-  -- Same INT holdable, Affliction Warlock (specID=265, INT) → stat matches,
-  -- normal ilvl comparison proceeds (regression check: matching stat must
-  -- still work after adding the gate).
-  local guid = "Player-0-WarlockHoldableStat"
-  mockMemberGear(guid, "party1", "WARLOCK", 265, { [17] = 100 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g })
-  end
-
-  local holdableLink = "item:holdable_int_statmatch"
-  mockItem(holdableLink, { "Luminescent Sprout", nil, 4, 470, nil,
-    "Armor", "Miscellaneous", nil, "INVTYPE_HOLDABLE", nil, nil, 4, 0, 0 })
-
-  local itemData = {
-    link         = holdableLink,
-    ilvl         = 470,
-    equipLoc     = "INVTYPE_HOLDABLE",
-    classID      = 4,
-    subID        = 0,
-    slotIDs      = {17},
-    slotCategory = "offhand",
-    offhandSubID = 0,
-    primaryStats = { INT = true },
-  }
-
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 10,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#updateCalls >= 1,
-    "Affliction Warlock (INT) must be eligible for an INT holdable when ilvl delta clears threshold")
-
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-end
 
 function TestLoot:test_self_check_offhand_stat_mismatch_not_upgrade()
   -- Player is Retribution Paladin (STR); an INT holdable drops. Must NOT
@@ -2601,59 +1951,6 @@ function TestLoot:test_self_check_offhand_stat_mismatch_not_upgrade()
 
   lu.assertFalse(callIsPlayerUpgrade(itemData, 10),
     "INT holdable must not read as a self-upgrade for a STR spec, regardless of ilvl delta")
-end
-
-function TestLoot:test_offhand_heirloom_equipped_excludes()
-  -- Candidate wears a heirloom holdable in slot 17 at level 50 → excluded
-  -- regardless of ilvl delta, same as every other heirloom-bearing slot.
-  local guid = "Player-0-OffhandHeirloom"
-  _mockGuids["party1"] = guid
-  _mockUnitClass["party1"] = { "Warlock", "WARLOCK" }
-  _mockUnitLevel["party1"] = 50
-  local heirloomLink = "item:33301"
-  _mockHeirloomItemIDs[33301] = true
-  _mockIlvl[heirloomLink] = 300
-  LIF.Cache.Add(guid)
-  -- Heirloom holdable lives in the inspect cache (slot 17), exactly as queue.lua
-  -- captures it. The compare reads the cache, not a live GetInventoryItemLink.
-  LIF.Cache.SetComplete(guid, { gear = { [17] = { link = heirloomLink, ilvl = 300 } }, specID = 265 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g })
-  end
-
-  local holdableLink = "item:holdable_heirloom_gate"
-  mockItem(holdableLink, { "Luminescent Sprout", nil, 4, 470, nil,
-    "Armor", "Miscellaneous", nil, "INVTYPE_HOLDABLE", nil, nil, 4, 0, 0 })
-
-  local itemData = {
-    link         = holdableLink,
-    ilvl         = 470,
-    equipLoc     = "INVTYPE_HOLDABLE",
-    classID      = 4,
-    subID        = 0,
-    slotIDs      = {17},
-    slotCategory = "offhand",
-    offhandSubID = 0,
-  }
-
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 10,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertEquals(#updateCalls, 0,
-    "Heirloom-equipped offhand slot must exclude the candidate regardless of ilvl delta")
-
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
 end
 
 function TestLoot:test_self_check_offhand_heirloom_equipped_not_upgrade()
@@ -2681,169 +1978,6 @@ function TestLoot:test_self_check_offhand_heirloom_equipped_not_upgrade()
 
   lu.assertFalse(callIsPlayerUpgrade(itemData, 10),
     "Heirloom-equipped offhand slot must not read as a self-upgrade, regardless of ilvl delta")
-end
-
--- ---------- Fury Warrior dual-slot 2H (case 10) ----------
-
-function TestLoot:test_fury_warrior_2h_drop_dual_slot_eligible()
-  -- Fury Warrior (specID=72) + 2H axe drop: slot16=460, slot17=455, drop=470, threshold=10
-  -- min(460,455)=455; delta=15 >= 10 → eligible; candidate.ilvl_current=455, slotID=17.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-FuryWarrior2H"
-  mockMemberGear(guid, "party1", "WARRIOR", 72, { [16] = 460, [17] = 455 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g, data = data })
-  end
-
-  -- 2H Axe: classID=2, subID=1 (Two-Handed Axes), WARRIOR in allow-set
-  local axeLink = "item:2h_axe_fury"
-  mockItem(axeLink, { "Axe of the Furious", nil, 4, 470, nil,
-    "Weapon", "Two-Handed Axes", nil, "INVTYPE_2HWEAPON", nil, nil, 2, 1, 0 })
-  _mockItemStats[axeLink] = { ITEM_MOD_STRENGTH_SHORT = 300 }
-
-  local itemData = {
-    link         = axeLink,
-    ilvl         = 470,
-    equipLoc     = "INVTYPE_2HWEAPON",
-    classID      = 2,
-    subID        = 1,
-    slotIDs      = {16, 17},
-    slotCategory = "weapon",
-    weaponSubID  = 1,
-    primaryStats  = { STR = true },
-  }
-
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 10,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#updateCalls >= 1,
-    "Fury Warrior: 2H drop 470, slots 460/455, threshold 10 → eligible (min=455, delta=15)")
-  lu.assertEquals(updateCalls[1].data.ilvl_current, 455,
-    "Fury Warrior candidate ilvl_current must be min(slot16=460, slot17=455)=455")
-  lu.assertEquals(updateCalls[1].data.slotID, 17,
-    "Fury Warrior candidate slotID must be 17 (lower slot)")
-
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-end
-
-function TestLoot:test_fury_warrior_2h_drop_dual_slot_ineligible()
-  -- Fury Warrior: drop=460, slots 455/458. min(455,458)=455; delta=5 < 10 → ineligible.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-FuryWarrior2HLow"
-  mockMemberGear(guid, "party1", "WARRIOR", 72, { [16] = 455, [17] = 458 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g })
-  end
-
-  local axeLink = "item:2h_axe_fury_low"
-  mockItem(axeLink, { "Axe of the Furious", nil, 4, 460, nil,
-    "Weapon", "Two-Handed Axes", nil, "INVTYPE_2HWEAPON", nil, nil, 2, 1, 0 })
-  _mockItemStats[axeLink] = { ITEM_MOD_STRENGTH_SHORT = 280 }
-
-  local itemData = {
-    link         = axeLink,
-    ilvl         = 460,
-    equipLoc     = "INVTYPE_2HWEAPON",
-    classID      = 2,
-    subID        = 1,
-    slotIDs      = {16, 17},
-    slotCategory = "weapon",
-    weaponSubID  = 1,
-    primaryStats  = { STR = true },
-  }
-
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 10,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertEquals(#updateCalls, 0,
-    "Fury Warrior: drop=460, min(455,458)=455, delta=5 < threshold 10 → ineligible")
-
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-end
-
--- ---------- Fury Warrior + offhand drop (case 11, D-16) ----------
-
-function TestLoot:test_offhand_usability_gate_rejects_before_cross_config()
-  -- The spec usability gate precedes the D-16 cross-config compare: a Protection
-  -- Paladin (off-hand item = shield only) is rejected for a HOLDABLE regardless
-  -- of what's equipped — even wielding a 2H, a holdable is never usable, so we
-  -- never reach the straight-across ilvl compare.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-Pala2HGate"
-  mockMemberGear(guid, "party1", "PALADIN", 66, { [16] = 460 })
-  -- Prot Paladin can't wield a 2H, but set one to prove the usability gate fires
-  -- FIRST — before any 2H/cross-config handling.
-  local slot16Link = "item:Player-0-Pala2HGates16"
-  _mockItemInfo[slot16Link] = { "Ashkandur", nil, 4, 460, nil,
-    "Weapon", "Two-Handed Swords", nil, "INVTYPE_2HWEAPON", nil, nil, 2, 8, 0 }
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g })
-  end
-
-  local holdableLink = "item:holdable_d16_gate"
-  mockItem(holdableLink, { "Luminescent Sprout", nil, 4, 470, nil,
-    "Armor", "Miscellaneous", nil, "INVTYPE_HOLDABLE", nil, nil, 4, 0, 0 })
-
-  local itemData = {
-    link         = holdableLink,
-    ilvl         = 470,
-    equipLoc     = "INVTYPE_HOLDABLE",
-    classID      = 4,
-    subID        = 0,
-    slotIDs      = {17},
-    slotCategory = "offhand",
-    offhandSubID = 0,
-  }
-
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 10,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertEquals(#updateCalls, 0,
-    "Protection Paladin (shield-only off-hand) must be rejected for a holdable regardless of the 2H")
-
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
 end
 
 -- ---------- WEAPONOFFHAND slot 17 regression lock (CR-02) ----------
@@ -2877,59 +2011,6 @@ function TestLoot:test_weaponoffhand_self_check_uses_slot17()
 
   local result = callIsPlayerUpgrade(itemData, 10)
   lu.assertTrue(result, "WEAPONOFFHAND self-check must read slot 17 (460 not 490)")
-end
-
-function TestLoot:test_weaponoffhand_member_eligibility_slotid_17()
-  -- ROGUE member with slot16=490, slot17=460; WEAPONOFFHAND dagger drop=490, threshold=10
-  -- Correct: reads slot 17 → delta=30 >= 10 → eligible, slotID=17
-  -- Buggy (slot 16): delta=0 < 10 → ineligible
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "Player-0-WOHRogue"
-  mockMemberGear(guid, "party1", "ROGUE", 259, { [16] = 490, [17] = 460 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g, data = data })
-  end
-
-  local wohLink = "item:woh_dagger_member"
-  mockItem(wohLink, { "Offhand Dagger", nil, 4, 490, nil,
-    "Weapon", "Daggers", nil, "INVTYPE_WEAPONOFFHAND", nil, nil, 2, 15, 0 })
-  _mockItemStats[wohLink] = { ITEM_MOD_AGILITY_SHORT = 150 }
-
-  local itemData = {
-    link        = wohLink,
-    ilvl        = 490,
-    equipLoc    = "INVTYPE_WEAPONOFFHAND",
-    classID     = 2,
-    subID       = 15,
-    slotIDs     = {17},
-    slotCategory = "weapon",
-    weaponSubID = 15,
-    primaryStats = { AGI = true },
-  }
-
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 10,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#updateCalls >= 1,
-    "WEAPONOFFHAND member eligibility: slot17=460, drop=490, delta=30 >= 10 → eligible")
-  lu.assertEquals(updateCalls[1].data.slotID, 17,
-    "WEAPONOFFHAND member eligibility: slotID must be 17 (not 16)")
-
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
 end
 
 -- ============================================================
@@ -3140,80 +2221,6 @@ function TestCloakEquipLoc:test_statless_cloak_evaluate_includes_all_specs()
     "Frost Mage must be queued on stat-less cloak (ilvl-only)")
 end
 
-function TestCloakEquipLoc:test_int_cloak_inspect_ready_str_spec_ineligible()
-  -- OnLootInspectReady: Ret Paladin (STR) → stat gate fires → RemoveCandidate.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "GUID-RET-PAL-INSPECT"
-  mockMemberGear(guid, "party1", "PALADIN", 70, { [15] = 150 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local removeCalls = {}
-  LIF.Popup_RemoveCandidate = function(g, itemLink)
-    table.insert(removeCalls, { guid = g, itemLink = itemLink })
-  end
-
-  local link = "item:int_cloak_inspect_ret"
-  local itemData = {
-    link = link, ilvl = 220, equipLoc = "INVTYPE_CLOAK",
-    slotIDs = {15}, slotCategory = "back",
-    primaryStats = { INT = true },
-  }
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 1,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#removeCalls > 0,
-    "Popup_RemoveCandidate must fire when INT cloak mismatches STR spec (Ret Paladin)")
-  LIF.Popup_RemoveCandidate = nil
-end
-
-function TestCloakEquipLoc:test_int_cloak_inspect_ready_int_spec_eligible()
-  -- OnLootInspectReady: Frost Mage (INT) → stat gate passes → UpdateCandidate.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "GUID-FROST-MAGE-INSPECT"
-  mockMemberGear(guid, "party1", "MAGE", 64, { [15] = 100 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g, data = data, itemLink = itemLink })
-  end
-
-  local link = "item:int_cloak_inspect_mage"
-  local itemData = {
-    link = link, ilvl = 220, equipLoc = "INVTYPE_CLOAK",
-    slotIDs = {15}, slotCategory = "back",
-    primaryStats = { INT = true },
-  }
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 1,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#updateCalls > 0,
-    "Popup_UpdateCandidate must fire when INT cloak matches INT spec (Frost Mage)")
-  LIF.Popup_UpdateCandidate = nil
-end
-
 -- ============================================================
 -- TestRingStatGate
 -- Rings get a primaryStats set from GetItemPrimaryStats and EvaluateCandidates
@@ -3267,80 +2274,6 @@ function TestRingStatGate:test_int_ring_self_check_int_spec_is_upgrade()
   lu.assertTrue(result, "INT ring ilvl 220 vs 100 must be a self-upgrade for INT spec (Frost Mage)")
 end
 
-function TestRingStatGate:test_int_ring_inspect_ready_str_spec_ineligible()
-  -- OnLootInspectReady: Ret Paladin (STR) → stat gate must fire → RemoveCandidate.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "GUID-RET-PAL-RING-INSPECT"
-  mockMemberGear(guid, "party1", "PALADIN", 70, { [11] = 150, [12] = 150 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local removeCalls = {}
-  LIF.Popup_RemoveCandidate = function(g, itemLink)
-    table.insert(removeCalls, { guid = g, itemLink = itemLink })
-  end
-
-  local link = "item:int_ring_inspect_ret"
-  local itemData = {
-    link = link, ilvl = 220, equipLoc = "INVTYPE_FINGER",
-    slotIDs = {11, 12}, slotCategory = "ring",
-    primaryStats = { INT = true },
-  }
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 1,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#removeCalls > 0,
-    "Popup_RemoveCandidate must fire when INT ring mismatches STR spec (Ret Paladin)")
-  LIF.Popup_RemoveCandidate = nil
-end
-
-function TestRingStatGate:test_int_ring_inspect_ready_int_spec_eligible()
-  -- OnLootInspectReady: Frost Mage (INT) → stat gate passes → UpdateCandidate.
-  if LIF.OnLootInspectReady == nil then
-    lu.skip("LIF.OnLootInspectReady not yet implemented")
-  end
-
-  local guid = "GUID-FROST-MAGE-RING-INSPECT"
-  mockMemberGear(guid, "party1", "MAGE", 64, { [11] = 100, [12] = 100 })
-  _mockGuids["player"] = "GUID-SELF"
-
-  local updateCalls = {}
-  LIF.Popup_UpdateCandidate = function(g, data, itemLink)
-    table.insert(updateCalls, { guid = g, data = data, itemLink = itemLink })
-  end
-
-  local link = "item:int_ring_inspect_mage"
-  local itemData = {
-    link = link, ilvl = 220, equipLoc = "INVTYPE_FINGER",
-    slotIDs = {11, 12}, slotCategory = "ring",
-    primaryStats = { INT = true },
-  }
-  table.insert(LIF.pendingLootItems, {
-    itemData            = itemData,
-    t                   = 0,
-    threshold           = 1,
-    confirmedCandidates = {},
-    scanningGuids       = { [guid] = true },
-    popupOpened         = true,
-  })
-
-  LIF.OnLootInspectReady(guid)
-
-  lu.assertTrue(#updateCalls > 0,
-    "Popup_UpdateCandidate must fire when INT ring matches INT spec (Frost Mage)")
-  LIF.Popup_UpdateCandidate = nil
-end
-
 -- ============================================================
 -- TestUncachedItemDefer (REV-008)
 -- GetItemInfo returns nil for items not yet in the client cache (first kill
@@ -3378,6 +2311,28 @@ function TestUncachedItemDefer:test_uncached_item_defers_then_processes()
   FirePendingAfterCallbacks()  -- fires 0-frame tradeability defer from the retry
   lu.assertEquals(#LIF.pendingLootItems, 1,
     "deferred retry must process the loot event once item data is cached")
+end
+
+function TestUncachedItemDefer:test_reset_during_item_load_cancels_the_deferred_pipeline()
+  -- AUD-010 (item-load path): a Loot_Reset during the ContinueOnItemLoad wait must
+  -- cancel the drop. The re-call would otherwise capture a fresh generation and
+  -- proceed against the cleared state (stale chat + orphan pending entry). The
+  -- generation captured before Step 0 guards the item-load callback.
+  local link = "item:990010"
+  _mockGuids["player"] = "GUID-SELF"
+  _mockGearLinks["player"] = { [5] = "item:990011" }
+  _mockIlvl["item:990011"] = 300
+
+  LIF.OnPlayerLootReceived(link, 990010)   -- uncached → registers ContinueOnItemLoad
+  lu.assertEquals(#_pendingItemLoadCallbacks, 1, "precondition: one item-load callback pending")
+
+  mockItem(link, { "Fresh Boss Chest", nil, 3, 184, nil, "Armor", "Leather", nil, "INVTYPE_CHEST", nil, nil, 4, 2, 0 })
+  LIF.Loot_Reset()                          -- group disbands during the item-load wait
+  FirePendingItemLoads()                    -- callback runs → must bail on the gen change
+  FirePendingAfterCallbacks()               -- nothing should have been scheduled to proceed
+
+  lu.assertEquals(#LIF.pendingLootItems, 0,
+    "a Loot_Reset during the item-load wait must cancel the deferred pipeline — no orphan entry (AUD-010)")
 end
 
 function TestUncachedItemDefer:test_still_uncached_after_load_does_not_loop()
@@ -3590,8 +2545,6 @@ function TestPartialInspectEligibilityGate:setUp()
   LIF.Queue_StopAndReset()
   LIF.pendingLootItems = {}
   LIF.ShowPopup             = _origShowPopup
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-  LIF.Popup_RemoveCandidate = _origPopupRemoveCand
 end
 
 function TestPartialInspectEligibilityGate:test_pending_member_not_evaluated()
@@ -3694,8 +2647,6 @@ function TestDualWield:setUp()
   LIF.Queue_StopAndReset()
   LIF.pendingLootItems = {}
   LIF.ShowPopup             = _origShowPopup
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-  LIF.Popup_RemoveCandidate = _origPopupRemoveCand
 end
 
 -- Drive _checkMemberEligibility through OnLootInspectReady; returns captured candidates or nil.
@@ -3785,6 +2736,356 @@ function TestDualWield:test_offhand_weapon_eligible_for_dw_spec()
   lu.assertEquals(captured[1].ilvl_current, 100)
 end
 
+function TestDualWield:test_member_dw_mainhand_heirloom_compares_offhand()
+  -- Frost DK (dual-wield) with an ACTIVE heirloom in the main hand and a normal
+  -- beatable weapon in the off-hand. An either-hand 1H drop must still be judged
+  -- against the non-heirloom off-hand, not skipped because the MH is a heirloom
+  -- (M3). Skip fully only when BOTH hands hold active heirlooms.
+  local guid = "Player-0-FrostDKHeir"
+  mockMemberGear(guid, "party1", "DEATHKNIGHT", 251, { [16] = 200, [17] = 180 })
+  _mockUnitLevel["party1"] = 50
+  -- Override the cached main-hand link with an active 1H heirloom (equipLoc
+  -- resolved, so the M1 fail-closed doesn't treat it as possibly-2H).
+  local member = LIF.Cache.GetMember(guid)
+  member.gear[16] = { link = "item:99201", ilvl = 200, equipLoc = "INVTYPE_WEAPON" }
+  _mockHeirloomItemIDs[99201] = true
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:dw_1h_sword", ilvl = 200,
+                     equipLoc = "INVTYPE_WEAPON", classID = 2, subID = 7,
+                     slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 7 }
+
+  local captured = resolveMemberForItem(guid, itemData)
+  lu.assertNotNil(captured,
+    "MH-heirloom dual-wielder must be judged against the beatable off-hand")
+  lu.assertEquals(captured[1].slotID, 17, "comparison must target the non-heirloom off-hand")
+  lu.assertEquals(captured[1].ilvl_current, 180)
+  lu.assertEquals(captured[1].delta, 20)
+end
+
+function TestDualWield:test_member_dw_both_hands_heirloom_skipped()
+  -- Both hands hold active heirlooms — neither can be beaten, so an either-hand
+  -- 1H drop is correctly skipped (M3 boundary).
+  local guid = "Player-0-FrostDKBothHeir"
+  mockMemberGear(guid, "party1", "DEATHKNIGHT", 251, { [16] = 200, [17] = 200 })
+  _mockUnitLevel["party1"] = 50
+  local member = LIF.Cache.GetMember(guid)
+  member.gear[16] = { link = "item:99202", ilvl = 200 }
+  member.gear[17] = { link = "item:99203", ilvl = 200 }
+  _mockHeirloomItemIDs[99202] = true
+  _mockHeirloomItemIDs[99203] = true
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:dw_1h_sword2", ilvl = 200,
+                     equipLoc = "INVTYPE_WEAPON", classID = 2, subID = 7,
+                     slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 7 }
+
+  local captured = resolveMemberForItem(guid, itemData)
+  lu.assertNil(captured,
+    "both hands heirloom → nothing to beat → not a candidate")
+end
+
+function TestDualWield:test_member_dw_mainhand_2h_heirloom_blocks_1h_drop()
+  -- Frost DK with an active heirloom TWO-HANDER in the main hand and an empty
+  -- off-hand. A 1H drop must NOT be eligible: the off-hand can't be filled
+  -- without dropping the unbeatable 2H heirloom, so the empty slot 17 is not a
+  -- real compare target (M3 regression M3-R1).
+  local guid = "Player-0-FrostDK2H"
+  mockMemberGear(guid, "party1", "DEATHKNIGHT", 251, { [16] = 200 })  -- OH empty
+  _mockUnitLevel["party1"] = 50
+  local member = LIF.Cache.GetMember(guid)
+  member.gear[16] = { link = "item:99301", ilvl = 200, equipLoc = "INVTYPE_2HWEAPON" }
+  _mockHeirloomItemIDs[99301] = true
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:frost_1h", ilvl = 200,
+                     equipLoc = "INVTYPE_WEAPON", classID = 2, subID = 7,
+                     slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 7 }
+
+  local captured = resolveMemberForItem(guid, itemData)
+  lu.assertNil(captured,
+    "MH 2H heirloom + 1H drop: off-hand not fillable without dropping the heirloom → not a candidate")
+end
+
+function TestDualWield:test_member_titans_grip_2h_heirloom_still_eligible()
+  -- Titan's Grip Fury with a MH 2H heirloom and a beatable 2H in the off-hand:
+  -- a better 2H drop CAN replace the off-hand 2H (TG dual-wields two-handers),
+  -- so it stays eligible — the M3-R1 block must not catch this.
+  local guid = "Player-0-FuryTG"
+  mockMemberGear(guid, "party1", "WARRIOR", 72, { [16] = 200, [17] = 180 })
+  _mockUnitLevel["party1"] = 50
+  local member = LIF.Cache.GetMember(guid)
+  member.gear[16] = { link = "item:99302", ilvl = 200 }
+  mockItem("item:99302", { "Heirloom Greataxe", nil, 3, 200, nil, "Weapon", "Axes", nil, "INVTYPE_2HWEAPON", nil, nil, 2, 1, 1 })
+  _mockHeirloomItemIDs[99302] = true
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:fury_2h", ilvl = 210,
+                     equipLoc = "INVTYPE_2HWEAPON", classID = 2, subID = 1,
+                     slotCategory = "weapon", slotIDs = {16, 17},
+                     weaponSubID = 1 }
+
+  local captured = resolveMemberForItem(guid, itemData)
+  lu.assertNotNil(captured,
+    "Titan's Grip 2H drop beats the off-hand 2H even with a MH heirloom")
+  lu.assertEquals(captured[1].slotID, 17, "compare against the beatable off-hand 2H")
+end
+
+function TestDualWield:test_member_titans_grip_single_2h_heirloom_empty_oh_skipped()
+  -- Titan's Grip Fury with ONE active 2H heirloom in the main hand and an EMPTY
+  -- off-hand. A normal 2H drop must NOT be eligible: a leveling Fury fills the
+  -- empty hand with a second (scaling) 2H heirloom, not a random drop, so the
+  -- empty slot 17 is not a real compare target. Guards the false positive from
+  -- comparing a 2H drop against an ilvl-0 empty hand.
+  local guid = "Player-0-FuryTGSingleHeir"
+  mockMemberGear(guid, "party1", "WARRIOR", 72, { [16] = 200 })  -- OH empty
+  _mockUnitLevel["party1"] = 50
+  local member = LIF.Cache.GetMember(guid)
+  member.gear[16] = { link = "item:99304", ilvl = 200, equipLoc = "INVTYPE_2HWEAPON" }
+  _mockHeirloomItemIDs[99304] = true
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:fury_2h_drop", ilvl = 210,
+                     equipLoc = "INVTYPE_2HWEAPON", classID = 2, subID = 1,
+                     slotCategory = "weapon", slotIDs = {16, 17},
+                     weaponSubID = 1 }
+
+  local captured = resolveMemberForItem(guid, itemData)
+  lu.assertNil(captured,
+    "single 2H heirloom + empty off-hand: they'll make a second heirloom → not a candidate")
+end
+
+function TestDualWield:test_member_dw_mainhand_1h_heirloom_empty_oh_skipped()
+  -- Frost DK (dual-1H) with a 1H heirloom in the main hand and an EMPTY off-hand.
+  -- A normal 1H drop must NOT be eligible: they fill the empty hand with a second
+  -- scaling heirloom, so comparing against the ilvl-0 empty hand is a false
+  -- positive (same empty-hand rule as the TG case, drop type aside).
+  local guid = "Player-0-FrostDK1HEmptyOH"
+  mockMemberGear(guid, "party1", "DEATHKNIGHT", 251, { [16] = 200 })  -- OH empty
+  _mockUnitLevel["party1"] = 50
+  local member = LIF.Cache.GetMember(guid)
+  member.gear[16] = { link = "item:99305", ilvl = 200, equipLoc = "INVTYPE_WEAPON" }
+  _mockHeirloomItemIDs[99305] = true
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:frost_1h_drop", ilvl = 210,
+                     equipLoc = "INVTYPE_WEAPON", classID = 2, subID = 7,
+                     slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 7 }
+
+  local captured = resolveMemberForItem(guid, itemData)
+  lu.assertNil(captured,
+    "1H heirloom + empty off-hand: they'll make a second heirloom → not a candidate")
+end
+
+function TestDualWield:test_member_dw_on_2h_1h_drop_worse_skipped()
+  -- AUD-301: Frost DK (dual-wield) currently on a NON-heirloom 2H @400 with an
+  -- empty off-hand. A weak 1H @100 drops. The empty off-hand is NOT fillable while
+  -- a 2H occupies the main hand, so the 1H must be judged STRAIGHT against the 2H
+  -- (400) — not min(16, empty 17=0). @100 loses → not a candidate. (The old
+  -- dual-min read the empty slot as ilvl 0 and false-positived every 1H.)
+  local guid = "Player-0-FrostDK2HNonHeir"
+  mockMemberGear(guid, "party1", "DEATHKNIGHT", 251, { [16] = 400 })  -- OH empty
+  _mockUnitLevel["party1"] = 50
+  local member = LIF.Cache.GetMember(guid)
+  member.gear[16] = { link = "item:fdk2h", ilvl = 400, equipLoc = "INVTYPE_2HWEAPON" }
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:fdk_1h_weak", ilvl = 100,
+                     equipLoc = "INVTYPE_WEAPON", classID = 2, subID = 7,
+                     slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 7 }
+
+  local captured = resolveMemberForItem(guid, itemData)
+  lu.assertNil(captured,
+    "AUD-301: 1H @100 vs a 2H @400 (empty OH not fillable) must NOT be a candidate")
+end
+
+function TestDualWield:test_member_dw_on_2h_1h_drop_better_compares_straight()
+  -- AUD-301: same Frost DK on a NON-heirloom 2H @400, empty off-hand. A 1H @405
+  -- drops → judged straight vs the 2H (400), clears +5 at threshold 1 → candidate,
+  -- basis = the 2H slot 16 @400 (NOT the empty off-hand @0).
+  local guid = "Player-0-FrostDK2HNonHeir2"
+  mockMemberGear(guid, "party1", "DEATHKNIGHT", 251, { [16] = 400 })
+  _mockUnitLevel["party1"] = 50
+  local member = LIF.Cache.GetMember(guid)
+  member.gear[16] = { link = "item:fdk2h2", ilvl = 400, equipLoc = "INVTYPE_2HWEAPON" }
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:fdk_1h_better", ilvl = 405,
+                     equipLoc = "INVTYPE_WEAPON", classID = 2, subID = 7,
+                     slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 7 }
+
+  local captured = resolveMemberForItem(guid, itemData)
+  lu.assertNotNil(captured, "AUD-301: 1H @405 beats the equipped 2H @400 straight")
+  lu.assertEquals(captured[1].slotID, 16,
+    "compare against the 2H main-hand slot, not the empty off-hand")
+  lu.assertEquals(captured[1].ilvl_current, 400,
+    "basis is the 2H ilvl (400), not the empty-slot 0")
+end
+
+function TestDualWield:test_self_dw_on_2h_1h_drop_not_self_upgrade()
+  -- AUD-301 player mirror: local player is Frost DK (dual-wield) on a NON-heirloom
+  -- 2H @400 with an empty off-hand. A 1H @100 drops. It must NOT read as a
+  -- self-upgrade (empty off-hand is not fillable under a 2H) — else the popup is
+  -- wrongly suppressed and a bogus "+N ilvl" line is emitted. Straight vs the 2H
+  -- (400), @100 loses.
+  _mockGetSpecialization = 1
+  _mockSpecializationInfo[1] = 251  -- Frost DK (dual-wield)
+  _mockUnitClass["player"] = { "Death Knight", "DEATHKNIGHT" }
+  local slot16Link = "item:self_fdk_2h"
+  _mockItemInfo[slot16Link] = { "TwoHandBlade", nil, 4, 400, nil,
+    "Weapon", "Two-Handed Swords", nil, "INVTYPE_2HWEAPON", nil, nil, 2, 8, 0 }
+  _mockIlvl[slot16Link] = 400
+  _mockGearLinks["player"] = { [16] = slot16Link }  -- OH empty
+
+  local itemData = { link = "item:self_fdk_1h", ilvl = 100,
+                     equipLoc = "INVTYPE_WEAPON", classID = 2, subID = 7,
+                     slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 7 }
+
+  lu.assertFalse(callIsPlayerUpgrade(itemData, 1),
+    "AUD-301: 1H @100 under a 2H @400 must not be a self-upgrade (empty OH not fillable)")
+end
+
+function TestDualWield:test_member_titans_grip_empty_oh_2h_drop_fills_hand()
+  -- AUD-301 regression guard: the straight-vs-2H rule must NOT catch a Titan's
+  -- Grip 2H drop. Fury (72) on a NON-heirloom 2H @200 with an EMPTY off-hand: a
+  -- 2H @210 drops → TG dual-wields two-handers, so it fills the empty off-hand and
+  -- stays eligible (min-vs-empty is correct here). Only true 1H drops are excluded.
+  local guid = "Player-0-FuryTGEmptyOH"
+  mockMemberGear(guid, "party1", "WARRIOR", 72, { [16] = 200 })  -- OH empty
+  _mockUnitLevel["party1"] = 50
+  local member = LIF.Cache.GetMember(guid)
+  member.gear[16] = { link = "item:furytg2h", ilvl = 200, equipLoc = "INVTYPE_2HWEAPON" }
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:fury_2h_fill", ilvl = 210,
+                     equipLoc = "INVTYPE_2HWEAPON", classID = 2, subID = 1,
+                     slotCategory = "weapon", slotIDs = {16, 17},
+                     weaponSubID = 1 }
+
+  local captured = resolveMemberForItem(guid, itemData)
+  lu.assertNotNil(captured,
+    "AUD-301 guard: TG 2H drop fills the empty off-hand → still a candidate")
+  lu.assertEquals(captured[1].slotID, 17,
+    "TG 2H drop compares against the empty off-hand it fills")
+end
+
+function TestDualWield:test_member_dw_on_2h_coldcache_mh_fails_closed()
+  -- AUD-301 hardening (M1): a member's main-hand link is present but its type is
+  -- unresolved in the cache (equipLoc nil), so is2HEquipped can't confirm the 2H.
+  -- With an empty off-hand, fall closed rather than min-vs-0 and false-positive
+  -- every 1H. (An OCCUPIED off-hand proves genuine dual-wield and stays safe.)
+  local guid = "Player-0-FrostDKColdMH"
+  mockMemberGear(guid, "party1", "DEATHKNIGHT", 251, { [16] = 400 })  -- OH empty
+  _mockUnitLevel["party1"] = 50
+  local member = LIF.Cache.GetMember(guid)
+  member.gear[16] = { link = "item:fdk_cold_mh", ilvl = 400, equipLoc = nil }  -- type unresolved
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:fdk_1h_cold", ilvl = 405,
+                     equipLoc = "INVTYPE_WEAPON", classID = 2, subID = 7,
+                     slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 7 }
+
+  local captured = resolveMemberForItem(guid, itemData)
+  lu.assertNil(captured,
+    "AUD-301/M1: unresolved main-hand type + empty off-hand must fail closed, not min-vs-0")
+end
+
+function TestDualWield:test_member_dw_1h_empty_oh_no_2h_still_eligible()
+  -- AUD-301 non-interception guard: a genuine dual-wielder with a non-heirloom 1H
+  -- in the main hand and an EMPTY off-hand (NO 2H) — the empty hand IS fillable, so
+  -- a 1H drop must stay eligible against it (min-vs-empty), NOT get diverted to a
+  -- straight main-hand compare. Locks that the 2H-only branch doesn't over-fire.
+  local guid = "Player-0-FrostDK1HEmptyOHNoHeir"
+  mockMemberGear(guid, "party1", "DEATHKNIGHT", 251, { [16] = 200 })  -- 1H MH, OH empty
+  _mockUnitLevel["party1"] = 50
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:fdk_1h_fill", ilvl = 150,
+                     equipLoc = "INVTYPE_WEAPON", classID = 2, subID = 7,
+                     slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 7 }
+
+  local captured = resolveMemberForItem(guid, itemData)
+  lu.assertNotNil(captured,
+    "AUD-301 guard: 1H fills the empty off-hand of a dual-wielder (no 2H) → candidate")
+  lu.assertEquals(captured[1].slotID, 17, "compare against the empty off-hand it fills")
+end
+
+function TestDualWield:test_self_dw_on_2h_1h_drop_better_is_self_upgrade()
+  -- AUD-301 player positive mirror: player Frost DK on a 2H @400, empty off-hand. A
+  -- 1H @405 drops → straight vs the 2H (400), clears +5 → IS a self-upgrade (they'd
+  -- swap the 2H for the better 1H), so the popup is suppressed for them.
+  _mockGetSpecialization = 1
+  _mockSpecializationInfo[1] = 251
+  _mockUnitClass["player"] = { "Death Knight", "DEATHKNIGHT" }
+  local slot16Link = "item:self_fdk_2h_pos"
+  _mockItemInfo[slot16Link] = { "TwoHandBlade", nil, 4, 400, nil,
+    "Weapon", "Two-Handed Swords", nil, "INVTYPE_2HWEAPON", nil, nil, 2, 8, 0 }
+  _mockIlvl[slot16Link] = 400
+  _mockGearLinks["player"] = { [16] = slot16Link }  -- OH empty
+
+  local itemData = { link = "item:self_fdk_1h_pos", ilvl = 405,
+                     equipLoc = "INVTYPE_WEAPON", classID = 2, subID = 7,
+                     slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 7 }
+
+  lu.assertTrue(callIsPlayerUpgrade(itemData, 1),
+    "AUD-301: 1H @405 straight-beats the equipped 2H @400 → self-upgrade")
+end
+
+function TestDualWield:test_member_outlaw_offhand_dagger_mh_heirloom_empty_oh_skipped()
+  -- AUD-305: Outlaw's off-hand accepts a dagger (its main hand does not), so a
+  -- dagger drop takes the single-slot hands=="off" path (weaponSlot 17). With an
+  -- active heirloom 1H in the MAIN hand and an EMPTY off-hand, a leveler fills the
+  -- empty hand with a duplicate scaling heirloom, not this drop — the same doctrine
+  -- the dual path already enforces (AUD-001/M2). Comparing the dagger vs the ilvl-0
+  -- empty off-hand is a false positive; must skip.
+  local guid = "Player-0-OutlawMHHeir"
+  mockMemberGear(guid, "party1", "ROGUE", 260, { [16] = 200 })  -- OH empty
+  _mockUnitLevel["party1"] = 50
+  local member = LIF.Cache.GetMember(guid)
+  member.gear[16] = { link = "item:99310", ilvl = 200, equipLoc = "INVTYPE_WEAPON" }
+  _mockHeirloomItemIDs[99310] = true
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:outlaw_dagger", ilvl = 50,
+                     equipLoc = "INVTYPE_WEAPON", classID = 2, subID = 15,
+                     slotCategory = "weapon", slotIDs = {16, 17},
+                     weaponSubID = 15 }
+
+  local captured = resolveMemberForItem(guid, itemData)
+  lu.assertNil(captured,
+    "AUD-305: off-hand dagger + MH heirloom + empty OH → duplicate heirloom fills the hand → not a candidate")
+end
+
+function TestDualWield:test_member_outlaw_offhand_dagger_empty_oh_no_heirloom_eligible()
+  -- AUD-305 non-interception guard: Outlaw with NO heirloom and an EMPTY off-hand.
+  -- An off-hand dagger drop fills the empty hand → still eligible vs ilvl 0. The
+  -- heirloom skip must not fire when the main hand isn't an active heirloom.
+  local guid = "Player-0-OutlawNoHeir"
+  mockMemberGear(guid, "party1", "ROGUE", 260, { [16] = 200 })  -- OH empty, non-heirloom MH
+  _mockUnitLevel["party1"] = 50
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:outlaw_dagger2", ilvl = 50,
+                     equipLoc = "INVTYPE_WEAPON", classID = 2, subID = 15,
+                     slotCategory = "weapon", slotIDs = {16, 17},
+                     weaponSubID = 15 }
+
+  local captured = resolveMemberForItem(guid, itemData)
+  lu.assertNotNil(captured,
+    "AUD-305: off-hand dagger fills an empty off-hand (no heirloom) → candidate")
+  lu.assertEquals(captured[1].slotID, 17, "compare against the empty off-hand it fills")
+end
+
 function TestDualWield:test_self_dw_spec_uses_lower_weapon_slot()
   -- Player is Assassination Rogue (dagger-locked, DW): MH 200, OH 100. A dagger
   -- drop ilvl 150 IS a self-upgrade (fills the weaker hand) — popup suppressed.
@@ -3840,8 +3141,6 @@ function TestMultiPrimaryStat:setUp()
   LIF.Queue_StopAndReset()
   LIF.pendingLootItems = {}
   LIF.ShowPopup             = _origShowPopup
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-  LIF.Popup_RemoveCandidate = _origPopupRemoveCand
 end
 
 -- AGI+INT one-hand axe (subID 0 allows SHAMAN/HUNTER/PALADIN among others).
@@ -4030,8 +3329,6 @@ function TestHunterWeaponType:setUp()
   LIF.Queue_StopAndReset()
   LIF.pendingLootItems = {}
   LIF.ShowPopup             = _origShowPopup
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-  LIF.Popup_RemoveCandidate = _origPopupRemoveCand
 end
 
 function TestHunterWeaponType:test_bm_hunter_eligible_for_bow()
@@ -4316,8 +3613,6 @@ function TestChatNotifications:setUp()
   LIF.Queue_StopAndReset()
   LIF.pendingLootItems = {}
   LIF.ShowPopup             = _origShowPopup
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-  LIF.Popup_RemoveCandidate = _origPopupRemoveCand
   LIF.IsItemTradeable = mockIsItemTradeable
   -- LootItForward = nil → LIF.Log "info" failsafe: show=true (Pitfall 3)
 end
@@ -4406,11 +3701,10 @@ function TestChatNotifications:test_party_eligible_emits_item_and_member_lines()
 
   LIF.OnLootInspectReady(druidGuid)
 
-  -- Item header line
-  lu.assertTrue(hasChatMsg("Chest of Green (300)"),
-    "Notification must include item name and ilvl")
-  lu.assertTrue(hasChatMsg("not an upgrade for you"),
-    "Notification must indicate item is not a self-upgrade")
+  -- No redundant "not an upgrade for you" header — the drop-time line already
+  -- announced the item; resolution reports the per-member outcome only.
+  lu.assertFalse(hasChatMsg("not an upgrade for you"),
+    "Resolution summary must NOT repeat the drop-time 'not an upgrade for you' header")
   -- Member line: "  Leafcaller (Balance Druid): armor +100 (200→300)"
   lu.assertTrue(hasChatMsg("Leafcaller"),
     "Notification must include party member name")
@@ -4456,10 +3750,69 @@ function TestChatNotifications:test_party_no_candidates_emits_no_upgrades_line()
 
   LIF.OnLootInspectReady(warriorGuid)
 
-  lu.assertTrue(hasChatMsg("not an upgrade for you"),
-    "Item header line must fire when party scan resolves")
-  lu.assertTrue(hasChatMsg("no party upgrades found"),
-    "Must emit 'no party upgrades found' when all members are ineligible")
+  lu.assertTrue(hasChatMsg("Helm of Quiet — no party upgrades found"),
+    "Must emit an item-named 'no party upgrades found' line when all members are ineligible")
+  lu.assertFalse(hasChatMsg("not an upgrade for you"),
+    "Resolution summary must NOT repeat the drop-time header")
+end
+
+function TestChatNotifications:test_drop_line_plural_candidate_count()
+  if LIF.OnPlayerLootReceived == nil then lu.skip("not yet implemented") end
+  _mockIsInInstance = { true, "party" }
+  _mockIsInGroup    = true
+  _mockGuids["player"]     = "GUID-SELF"
+  _mockUnitClass["player"] = { "Warrior", "WARRIOR" }  -- plate → leather chest is not a self-upgrade
+  mockMemberGear("Player-0-Cd1", "party1", "DRUID", 103, { [5] = 200 })
+  mockMemberGear("Player-0-Cd2", "party2", "ROGUE", 260, { [5] = 200 })
+
+  local link = "item:cd_plural_chest"
+  mockItem(link, { "Verdant Vest", nil, 4, 300, nil, "Armor", "Leather", nil, "INVTYPE_CHEST", nil, nil, 4, 2, 0 })
+
+  LIF.OnPlayerLootReceived(link, 88810)
+  FirePendingAfterCallbacks()
+
+  lu.assertTrue(hasChatMsg("Verdant Vest dropped — 2 possible candidates. Inspecting..."),
+    "Drop line must announce the item and PLURAL candidate count with 'Inspecting...'")
+end
+
+function TestChatNotifications:test_drop_line_singular_candidate_count()
+  if LIF.OnPlayerLootReceived == nil then lu.skip("not yet implemented") end
+  _mockIsInInstance = { true, "party" }
+  _mockIsInGroup    = true
+  _mockGuids["player"]     = "GUID-SELF"
+  _mockUnitClass["player"] = { "Warrior", "WARRIOR" }
+  mockMemberGear("Player-0-Cd3", "party1", "DRUID", 103, { [5] = 200 })
+
+  local link = "item:cd_singular_chest"
+  mockItem(link, { "Lone Leather", nil, 4, 300, nil, "Armor", "Leather", nil, "INVTYPE_CHEST", nil, nil, 4, 2, 0 })
+
+  LIF.OnPlayerLootReceived(link, 88811)
+  FirePendingAfterCallbacks()
+
+  lu.assertTrue(hasChatMsg("Lone Leather dropped — 1 possible candidate. Inspecting..."),
+    "Drop line must use SINGULAR 'candidate' for exactly one")
+  lu.assertFalse(hasChatMsg("1 possible candidates"),
+    "Must not use the plural form for a single candidate")
+end
+
+function TestChatNotifications:test_drop_line_zero_candidates_no_inspecting()
+  if LIF.OnPlayerLootReceived == nil then lu.skip("not yet implemented") end
+  _mockIsInInstance = { true, "party" }
+  _mockIsInGroup    = true
+  _mockGuids["player"]     = "GUID-SELF"
+  _mockUnitClass["player"] = { "Druid", "DRUID" }  -- leather → plate chest not a self-upgrade
+  mockMemberGear("Player-0-Cd4", "party1", "DRUID", 103, { [5] = 200 })  -- druid can't wear plate
+
+  local link = "item:cd_zero_chest"
+  mockItem(link, { "Plate Wall", nil, 4, 300, nil, "Armor", "Plate", nil, "INVTYPE_CHEST", nil, nil, 4, 4, 0 })
+
+  LIF.OnPlayerLootReceived(link, 88812)
+  FirePendingAfterCallbacks()
+
+  lu.assertTrue(hasChatMsg("Plate Wall dropped — 0 possible candidates."),
+    "Drop line must fire with zero count")
+  lu.assertFalse(hasChatMsg("Inspecting"),
+    "'Inspecting...' must NOT be appended when there are no candidates")
 end
 
 function TestChatNotifications:test_no_party_at_loot_time_no_notif()
@@ -4487,11 +3840,15 @@ function TestChatNotifications:test_no_party_at_loot_time_no_notif()
   lu.assertFalse(LIF.pendingLootItems[1].hadPartyMembers,
     "Precondition: hadPartyMembers must be false when no cache members")
 
-  -- Fire 4-second cleanup timer → _tryOpenPopup → no candidates → no notification.
+  -- The drop-time line still fires (0 possible candidates) — it announces that LIF
+  -- saw the drop. Fire the window timer → _tryOpenPopup → the RESOLUTION summary
+  -- ("no party upgrades found" / member lines) must NOT fire (gated on hadPartyMembers).
+  lu.assertTrue(hasChatMsg("Neck of Absence dropped — 0 possible candidates."),
+    "Drop line fires even with no candidates")
   FirePendingAfterCallbacks()
 
-  lu.assertFalse(hasChatMsg("[Loot It Forward]"),
-    "No notification must fire when hadPartyMembers=false (no party members at loot time)")
+  lu.assertFalse(hasChatMsg("no party upgrades found"),
+    "Resolution summary must NOT fire when hadPartyMembers=false (no party members at loot time)")
 end
 
 -- ============================================================
@@ -4545,6 +3902,80 @@ function TestIsItemTradeable:test_item_not_in_bags_returns_false()
   -- Bags are empty → item not found → not tradeable.
   lu.assertFalse(LIF.IsItemTradeable("item:77777::::::::::0", 77777),
     "Item not found in any bag must not be tradeable")
+end
+
+function TestIsItemTradeable:test_count_tradeable_slots_two_copies()
+  -- AUD-310: two tradeable copies of the same itemID (D-03 stacked drop). Presence
+  -- alone can't tell a completed trade of one copy from a cancel; the COUNT can.
+  local link = "item:55501::::::::::0"
+  _mockContainerItems[0] = { [1] = { hyperlink = link }, [2] = { hyperlink = link } }
+  _mockScanTooltipLines[link] = {
+    "Duplicate Drop", "Soulbound", string.format(BIND_TRADE_TIME_REMAINING, "2 hours"),
+  }
+  lu.assertEquals(LIF.CountTradeableSlots(55501), 2,
+    "both tradeable copies of the same itemID must be counted")
+end
+
+function TestIsItemTradeable:test_count_tradeable_slots_ignores_untimed_copy()
+  -- One tradeable copy + one owned (no timer) copy of the same itemID → count 1.
+  local timed   = "item:55502::::::::::0"
+  local untimed = "item:55502::::::::::1"   -- same itemID, different instance, no timer
+  _mockContainerItems[0] = { [1] = { hyperlink = timed }, [2] = { hyperlink = untimed } }
+  _mockScanTooltipLines[timed]   = { "Fresh", "Soulbound", string.format(BIND_TRADE_TIME_REMAINING, "2 hours") }
+  _mockScanTooltipLines[untimed] = { "Owned", "Soulbound" }
+  lu.assertEquals(LIF.CountTradeableSlots(55502), 1,
+    "only the copy with an active trade timer is counted")
+end
+
+function TestIsItemTradeable:test_count_tradeable_slots_none()
+  lu.assertEquals(LIF.CountTradeableSlots(55503), 0,
+    "no tradeable copies in bags → 0")
+end
+
+function TestIsItemTradeable:test_count_item_in_bags_ignores_timers()
+  -- AUD-402: plain copy count regardless of trade timer — used to detect an untimed
+  -- BoE trade's completion by decrease. Two copies (one timered, one not) → 2.
+  local timed   = "item:56001::::::::::0"
+  local untimed = "item:56001::::::::::1"
+  _mockContainerItems[0] = { [1] = { hyperlink = timed }, [2] = { hyperlink = untimed } }
+  _mockScanTooltipLines[timed] = { "Fresh", string.format(BIND_TRADE_TIME_REMAINING, "2 hours") }
+  lu.assertEquals(LIF.CountItemInBags(56001), 2,
+    "counts every copy of the itemID, timered or not")
+end
+
+function TestIsItemTradeable:test_count_item_in_bags_none()
+  lu.assertEquals(LIF.CountItemInBags(56002), 0,
+    "no copies in bags → 0")
+end
+
+function TestIsItemTradeable:test_count_item_in_bags_decrease_detects_trade()
+  -- The completion signal for an untimed BoE: baseline before, one fewer after.
+  local link = "item:56003::::::::::0"
+  _mockContainerItems[0] = { [1] = { hyperlink = link } }
+  local baseline = LIF.CountItemInBags(56003)
+  lu.assertEquals(baseline, 1)
+  _mockContainerItems[0] = {}  -- item left the bags (traded)
+  lu.assertTrue(LIF.CountItemInBags(56003) < baseline, "a traded copy decreases the count")
+end
+
+function TestIsItemTradeable:test_quest_bound_item_not_tradeable()
+  -- bindType 4 (Quest) is definitively untradeable — the fast-path must skip
+  -- it, never fall through the "not BoP → tradeable" branch. No bag copy set:
+  -- if the bindType skip fails, the tooltip scan finds nothing and this would
+  -- only accidentally pass, so assert directly against the bindType branch.
+  local link = "item:33333::::::::::0"
+  mockItem(link, { "Quest Relic", nil, 3, 200, nil, "Armor", "Plate", nil, "INVTYPE_CHEST", nil, nil, 4, 0, 4 })
+  lu.assertFalse(LIF.IsItemTradeable(link, 33333),
+    "Quest-bound (bindType 4) items are never player-tradeable")
+end
+
+function TestIsItemTradeable:test_on_use_bound_item_stays_tradeable()
+  -- Boundary guard for the quest-bound fix: bindType 3 (Bind-on-Use) is
+  -- tradeable while unbound, exactly like BoE — the fix must skip only 4.
+  local link = "item:33334::::::::::0"
+  mockItem(link, { "On-Use Cloak", nil, 3, 200, nil, "Armor", "Cloth", nil, "INVTYPE_CLOAK", nil, nil, 4, 1, 3 })
+  lu.assertTrue(LIF.IsItemTradeable(link, 33334),
+    "Bind-on-Use (bindType 3) items are tradeable while unbound")
 end
 
 function TestIsItemTradeable:test_item_found_in_later_bag_slot()
@@ -4697,8 +4128,6 @@ function TestSpecFormFinal:setUp()
   LIF.Queue_StopAndReset()
   LIF.pendingLootItems = {}
   LIF.ShowPopup             = _origShowPopup
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-  LIF.Popup_RemoveCandidate = _origPopupRemoveCand
 end
 
 -- Statless weapon drop for subID / equipLoc (default main-hand INVTYPE_WEAPON).
@@ -5094,8 +4523,6 @@ function TestCrossConfigWeapon:setUp()
   LIF.Queue_StopAndReset()
   LIF.pendingLootItems = {}
   LIF.ShowPopup             = _origShowPopup
-  LIF.Popup_UpdateCandidate = _origPopupUpdateCand
-  LIF.Popup_RemoveCandidate = _origPopupRemoveCand
 end
 
 -- Turn the member's slot-16 item (created by mockMemberGear) into a real 2H, so
@@ -5103,6 +4530,10 @@ end
 local function equipMember2H(guid, ilvl)
   _mockItemInfo["item:" .. guid .. "s16"] = { "TwoHandStaff", nil, 4, ilvl, nil,
     "Weapon", "Staves", nil, "INVTYPE_2HWEAPON", nil, nil, 2, 10, 0 }
+  -- Reflect the 2H in the cached inspect snapshot: production caches equipLoc
+  -- per slot at inspect time and is2HEquipped reads that, not live GetItemInfo (M1).
+  local m = LIF.Cache.GetMember(guid)
+  if m and m.gear and m.gear[16] then m.gear[16].equipLoc = "INVTYPE_2HWEAPON" end
 end
 
 local function twoHandStaffDrop(link, ilvl)
@@ -5160,6 +4591,39 @@ function TestCrossConfigWeapon:test_2h_drop_vs_2h_member_compares_straight()
     "2H-vs-2H compares straight to the equipped 2H, not a halved average")
 end
 
+-- ---------- Cross-config displacing an ACTIVE heirloom → heirlooms win (M2) ----------
+
+function TestCrossConfigWeapon:test_2h_drop_displacing_heirloom_offhand_skipped()
+  -- Ele Shaman on 1H + an ACTIVE heirloom off-hand (level ≤69). A 2H displaces
+  -- BOTH hands, forcing off the unbeatable heirloom. Heirlooms win (M2): skip,
+  -- rather than average the heirloom's low scaling ilvl into the basis — which
+  -- would false-positive ((200+60)/2 = 130, so any 2H >130 looks like an upgrade).
+  local guid = "Player-0-EleHeirOH"
+  mockMemberGear(guid, "party1", "SHAMAN", 262, { [16] = 200, [17] = 60 })
+  _mockUnitLevel["party1"] = 50
+  LIF.Cache.GetMember(guid).gear[17] = { link = "item:88017", ilvl = 60, equipLoc = "INVTYPE_HOLDABLE" }
+  _mockHeirloomItemIDs[88017] = true
+  _mockGuids["player"] = "GUID-SELF"
+
+  lu.assertNil(resolveMemberForItem(guid, twoHandStaffDrop("item:staff195h", 195)),
+    "2H displacing an active heirloom off-hand must be skipped (heirlooms win)")
+end
+
+function TestCrossConfigWeapon:test_offhand_item_displacing_heirloom_2h_skipped()
+  -- Warlock on an ACTIVE heirloom 2H (level ≤69). A holdable that out-ilvls the
+  -- 2H would normally cross-config as eligible (switch to 1H+holdable), but
+  -- taking it means dropping the unbeatable heirloom 2H. Heirlooms win (M2): skip.
+  local guid = "Player-0-LockHeir2H"
+  mockMemberGear(guid, "party1", "WARLOCK", 265, { [16] = 200 })
+  _mockUnitLevel["party1"] = 50
+  LIF.Cache.GetMember(guid).gear[16] = { link = "item:88016", ilvl = 200, equipLoc = "INVTYPE_2HWEAPON" }
+  _mockHeirloomItemIDs[88016] = true
+  _mockGuids["player"] = "GUID-SELF"
+
+  lu.assertNil(resolveMemberForItem(guid, offhandHoldableDrop("item:hold210h", 210)),
+    "off-hand item displacing an active heirloom 2H must be skipped (heirlooms win)")
+end
+
 -- ---------- Off-hand item / 1H drop vs a 2H member → straight across ----------
 
 function TestCrossConfigWeapon:test_offhand_item_vs_2h_member_compares_straight_eligible()
@@ -5186,6 +4650,35 @@ function TestCrossConfigWeapon:test_offhand_item_vs_2h_member_ineligible_below_2
 
   lu.assertNil(resolveMemberForItem(guid, offhandHoldableDrop("item:hold195", 195)),
     "holdable @195 must lose to the equipped 2H @200 (not compare against empty)")
+end
+
+function TestCrossConfigWeapon:test_offhand_is2h_reads_cached_equiploc_not_live()
+  -- is2HEquipped must read the cached equipLoc (M1), not re-call GetItemInfo
+  -- live. Cache says slot 16 is a 2H @200 but the item is NOT in the local
+  -- GetItemInfo cache (no _mockItemInfo) — mimicking a loot-time cold cache. A
+  -- holdable @195 below the 2H must lose, proving it compared against the 2H and
+  -- not an empty off-hand (a live read would return nil → is2HEquipped false →
+  -- false positive vs slot 17 = 0).
+  local guid = "Player-0-Lock2HColdCache"
+  mockMemberGear(guid, "party1", "WARLOCK", 265, { [16] = 200 })
+  LIF.Cache.GetMember(guid).gear[16].equipLoc = "INVTYPE_2HWEAPON"  -- cache only; no _mockItemInfo
+  _mockGuids["player"] = "GUID-SELF"
+
+  lu.assertNil(resolveMemberForItem(guid, offhandHoldableDrop("item:hold195c", 195)),
+    "cold-cache 2H: holdable @195 must lose to the 2H (is2HEquipped read from cache)")
+end
+
+function TestCrossConfigWeapon:test_offhand_unresolved_mainhand_fails_closed()
+  -- Main-hand item present but equipLoc unresolved even at inspect time (cached
+  -- equipLoc nil): we can't tell if it's a 2H, so the off-hand drop is skipped
+  -- rather than compared against an empty off-hand slot (M1 fail-closed).
+  local guid = "Player-0-LockUnresolvedMH"
+  mockMemberGear(guid, "party1", "WARLOCK", 265, { [16] = 200 })
+  LIF.Cache.GetMember(guid).gear[16].equipLoc = nil  -- unresolved
+  _mockGuids["player"] = "GUID-SELF"
+
+  lu.assertNil(resolveMemberForItem(guid, offhandHoldableDrop("item:hold300u", 300)),
+    "unresolved main-hand type → off-hand drop skipped (fail closed)")
 end
 
 function TestCrossConfigWeapon:test_1h_drop_vs_2h_member_compares_straight()
@@ -5216,6 +4709,843 @@ function TestCrossConfigWeapon:test_offhand_item_vs_1h_offhand_member_uses_slot1
   lu.assertNotNil(captured, "shield @190 beats the equipped off-hand @180")
   lu.assertEquals(captured[1].ilvl_current, 180)
   lu.assertEquals(captured[1].slotID, 17)
+end
+
+-- ============================================================
+-- Member eligibility (AUD-311): direct rule-level tests of the exposed
+-- LIF.CheckMemberEligibility seam. Asserts the actual verdict + candidate fields
+-- (delta/slotID/ilvl_current) on the eligible path and the specific skip REASON on
+-- the ineligible path. The pipeline integration (OnLootInspectReady → _tryOpenPopup
+-- → ShowPopup) stays covered by the resolveMemberForItem-based TestDualWield suite.
+-- ============================================================
+TestMemberEligibility = {}
+
+function TestMemberEligibility:setUp()
+  ResetMocks()
+  LIF.Cache.Clear()
+  LIF.Queue_StopAndReset()
+  LIF.pendingLootItems = {}
+  LIF.ShowPopup             = _origShowPopup
+end
+
+-- Direct call into the exposed eligibility seam using the same member/unit the
+-- production OnLootInspectReady path resolves. Returns (eligible, candidate, reason).
+local function checkMember(guid, itemData, threshold)
+  return LIF.CheckMemberEligibility(itemData, LIF.Cache.GetMember(guid), LIF.GuidToUnit(guid), threshold or 1)
+end
+
+-- ---------- ring / trinket ----------
+
+function TestMemberEligibility:test_ring_statless_lower_of_two()
+  -- Statless ring compares against the lower of the two equipped rings (slot 11 @460).
+  local guid = "Player-0-RingElig"
+  mockMemberGear(guid, "party1", "DRUID", 103, { [11] = 460, [12] = 475 })
+  local itemData = { link = "item:ring_party", ilvl = 470, slotID = 11,
+                     equipLoc = "INVTYPE_FINGER", slotIDs = {11, 12}, slotCategory = "ring",
+                     itype = "Armor", subtype = "Miscellaneous" }
+  local eligible, cand, reason = checkMember(guid, itemData, 1)
+  lu.assertTrue(eligible, "statless ring beats the lower equipped ring")
+  lu.assertEquals(reason, "eligible")
+  lu.assertEquals(cand.slotID, 11)
+  lu.assertEquals(cand.ilvl_current, 460)
+  lu.assertEquals(cand.delta, 10)
+end
+
+function TestMemberEligibility:test_trinket_stat_mismatch()
+  -- AGI trinket vs an INT spec (Disc Priest 256) → stat gate rejects.
+  local guid = "Player-0-IntTrinket"
+  mockMemberGear(guid, "party1", "PRIEST", 256, { [13] = 450, [14] = 450 })
+  _mockItemStats["item:agi_trinket"] = { ITEM_MOD_AGILITY_SHORT = 150 }
+  local itemData = { link = "item:agi_trinket", ilvl = 470, slotID = 13,
+                     equipLoc = "INVTYPE_TRINKET", slotIDs = {13, 14}, slotCategory = "trinket",
+                     itype = "Armor", subtype = "Trinket", primaryStats = { AGI = true } }
+  local eligible, cand, reason = checkMember(guid, itemData, 1)
+  lu.assertFalse(eligible, "AGI trinket is not usable by an INT spec")
+  lu.assertNil(cand)
+  lu.assertEquals(reason, "stat mismatch (AGI/INT)")
+end
+
+function TestMemberEligibility:test_trinket_statless_ilvl_only()
+  -- Secondary-stat-only trinket → ilvl-only, lower of two (slot 13 @450).
+  local guid = "Player-0-SecTrinket"
+  mockMemberGear(guid, "party1", "DRUID", 103, { [13] = 450, [14] = 460 })
+  _mockItemStats["item:sec_trinket_party"] = { ITEM_MOD_HASTE_RATING_SHORT = 120 }
+  local itemData = { link = "item:sec_trinket_party", ilvl = 470, slotID = 13,
+                     equipLoc = "INVTYPE_TRINKET", slotIDs = {13, 14}, slotCategory = "trinket",
+                     itype = "Armor", subtype = "Trinket" }
+  local eligible, cand, reason = checkMember(guid, itemData, 1)
+  lu.assertTrue(eligible, "statless trinket falls back to ilvl-only lower-of-two")
+  lu.assertEquals(reason, "eligible")
+  lu.assertEquals(cand.slotID, 13)
+  lu.assertEquals(cand.ilvl_current, 450)
+  lu.assertEquals(cand.delta, 20)
+end
+
+-- ---------- neck/back + primary-stat ring: stat gate ----------
+
+function TestMemberEligibility:test_back_stat_mismatch()
+  -- INT cloak vs a STR spec (Ret Paladin 70) → back stat gate rejects.
+  local guid = "Player-0-RetPalaCloak"
+  mockMemberGear(guid, "party1", "PALADIN", 70, { [15] = 150 })
+  local itemData = { link = "item:int_cloak", ilvl = 220, equipLoc = "INVTYPE_CLOAK",
+                     slotIDs = {15}, slotCategory = "back", primaryStats = { INT = true } }
+  local eligible, cand, reason = checkMember(guid, itemData, 1)
+  lu.assertFalse(eligible, "INT cloak not usable by a STR spec")
+  lu.assertNil(cand)
+  lu.assertEquals(reason, "stat mismatch (INT/STR)")
+end
+
+function TestMemberEligibility:test_back_stat_match()
+  -- INT cloak vs an INT spec (Frost Mage 64) → stat gate passes.
+  local guid = "Player-0-FrostMageCloak"
+  mockMemberGear(guid, "party1", "MAGE", 64, { [15] = 100 })
+  local itemData = { link = "item:int_cloak_match", ilvl = 220, equipLoc = "INVTYPE_CLOAK",
+                     slotIDs = {15}, slotCategory = "back", primaryStats = { INT = true } }
+  local eligible, cand, reason = checkMember(guid, itemData, 1)
+  lu.assertTrue(eligible, "INT cloak usable by an INT spec")
+  lu.assertEquals(reason, "eligible")
+  lu.assertEquals(cand.slotID, 15)
+  lu.assertEquals(cand.ilvl_current, 100)
+  lu.assertEquals(cand.delta, 120)
+end
+
+function TestMemberEligibility:test_ring_stat_mismatch()
+  -- INT ring vs a STR spec (Ret Paladin 70) → ring stat gate rejects.
+  local guid = "Player-0-RetPalaRing"
+  mockMemberGear(guid, "party1", "PALADIN", 70, { [11] = 150, [12] = 150 })
+  local itemData = { link = "item:int_ring", ilvl = 220, equipLoc = "INVTYPE_FINGER",
+                     slotIDs = {11, 12}, slotCategory = "ring", primaryStats = { INT = true } }
+  local eligible, cand, reason = checkMember(guid, itemData, 1)
+  lu.assertFalse(eligible, "INT ring not usable by a STR spec")
+  lu.assertNil(cand)
+  lu.assertEquals(reason, "stat mismatch (INT/STR)")
+end
+
+function TestMemberEligibility:test_ring_stat_match()
+  -- INT ring vs an INT spec (Frost Mage 64) → stat gate passes, lower slot 11.
+  local guid = "Player-0-FrostMageRing"
+  mockMemberGear(guid, "party1", "MAGE", 64, { [11] = 100, [12] = 100 })
+  local itemData = { link = "item:int_ring_match", ilvl = 220, equipLoc = "INVTYPE_FINGER",
+                     slotIDs = {11, 12}, slotCategory = "ring", primaryStats = { INT = true } }
+  local eligible, cand, reason = checkMember(guid, itemData, 1)
+  lu.assertTrue(eligible, "INT ring usable by an INT spec")
+  lu.assertEquals(reason, "eligible")
+  lu.assertEquals(cand.slotID, 11)
+  lu.assertEquals(cand.ilvl_current, 100)
+  lu.assertEquals(cand.delta, 120)
+end
+
+-- ---------- armor + heirloom ----------
+
+function TestMemberEligibility:test_armor_type_mismatch()
+  -- Leather chest dropped for a Plate-wearing Warrior → armor-type gate rejects.
+  local guid = "Player-0-PlateWarrior"
+  mockMemberGear(guid, "party1", "WARRIOR", 72, { [5] = 460 })
+  local itemData = { link = "item:leather_chest", ilvl = 480,
+                     slotIDs = {5}, slotCategory = "armor", armorType = "Leather" }
+  local eligible, cand, reason = checkMember(guid, itemData, 1)
+  lu.assertFalse(eligible, "Leather is not the Warrior's armor type")
+  lu.assertNil(cand)
+  lu.assertStrContains(reason, "armor type mismatch")
+end
+
+function TestMemberEligibility:test_armor_heirloom_slot_excludes()
+  -- Candidate wears an active heirloom chest at level 50 → excluded (SC2).
+  local guid = "Player-0-HeirloomArmor"
+  _mockGuids["party1"] = guid
+  _mockUnitClass["party1"] = { "Druid", "DRUID" }
+  _mockUnitLevel["party1"] = 50
+  _mockHeirloomItemIDs[22201] = true
+  LIF.Cache.Add(guid)
+  LIF.Cache.SetComplete(guid, { gear = { [5] = { link = "item:22201", ilvl = 300 } }, specID = 103 })
+  local itemData = { link = "item:22202", ilvl = 400,
+                     slotIDs = {5}, slotCategory = "armor", armorType = "Leather" }
+  local eligible, cand, reason = checkMember(guid, itemData, 1)
+  lu.assertFalse(eligible, "active heirloom armor slot is unbeatable")
+  lu.assertNil(cand)
+  lu.assertEquals(reason, "heirloom")
+end
+
+function TestMemberEligibility:test_armor_nil_slot_falls_through()
+  -- Empty gear (nil slot) → heirloom check skipped, nil=0 ilvl → eligible (SC4).
+  local guid = "Player-0-NilSlotArmor"
+  _mockGuids["party1"] = guid
+  _mockUnitClass["party1"] = { "Druid", "DRUID" }
+  _mockUnitLevel["party1"] = 50
+  LIF.Cache.Add(guid)
+  LIF.Cache.SetComplete(guid, { gear = {}, specID = 103 })
+  local itemData = { link = "item:22203", ilvl = 400,
+                     slotIDs = {5}, slotCategory = "armor", armorType = "Leather" }
+  local eligible, cand, reason = checkMember(guid, itemData, 1)
+  lu.assertTrue(eligible, "empty slot falls through to the nil=0 ilvl path")
+  lu.assertEquals(reason, "eligible")
+  lu.assertEquals(cand.slotID, 5)
+  lu.assertEquals(cand.ilvl_current, 0)
+  lu.assertEquals(cand.delta, 400)
+end
+
+-- ---------- weapon usability + stat + slot ----------
+
+function TestMemberEligibility:test_weapon_uses_cached_ilvl_not_wiped_live_read()
+  -- ClearInspectPlayer wipes the live slot-16 read; the compare must use the
+  -- cached snapshot (ilvl 70), not the wiped live read (0) that fabricates +220.
+  local guid = "Player-0-CacheWeapon"
+  mockMemberGear(guid, "party1", "DRUID", 102, { [16] = 70 })
+  _mockGearLinks["party1"][16] = nil
+  local link = "item:cache_weapon_dagger"
+  local itemData = classifyMockItem(link,
+    { "INTDagger", nil, 4, 220, nil, "Weapon", "Daggers", nil, "INVTYPE_WEAPON", nil, nil, 2, 15, 0 },
+    { ITEM_MOD_INTELLECT_SHORT = 190 })
+  local eligible, cand, reason = checkMember(guid, itemData, 1)
+  lu.assertTrue(eligible, "INT dagger beats the cached MH")
+  lu.assertEquals(reason, "eligible")
+  lu.assertEquals(cand.slotID, 16)
+  lu.assertEquals(cand.ilvl_current, 70, "must read the cached MH ilvl, not the wiped live read")
+  lu.assertEquals(cand.delta, 150)
+end
+
+function TestMemberEligibility:test_weapon_warglaive_shaman_not_usable()
+  -- Warglaive (subID 9) is DEMONHUNTER-only → Enhancement Shaman (263) not usable.
+  local guid = "Player-0-ShamanWarglaive"
+  mockMemberGear(guid, "party1", "SHAMAN", 263, { [16] = 450 })
+  local link = "item:warglaive_shaman"
+  _mockItemStats[link] = { ITEM_MOD_INTELLECT_SHORT = 200 }
+  local itemData = { link = link, ilvl = 470, equipLoc = "INVTYPE_WEAPON",
+                     classID = 2, subID = 9, slotIDs = {16}, slotCategory = "weapon",
+                     weaponSubID = 9, primaryStats = { INT = true } }
+  local eligible, cand, reason = checkMember(guid, itemData, 10)
+  lu.assertFalse(eligible, "warglaive not usable by a Shaman spec")
+  lu.assertNil(cand)
+  lu.assertStrContains(reason, "weapon not usable by spec")
+end
+
+function TestMemberEligibility:test_weapon_warglaive_demonhunter_usable()
+  -- Warglaive (subID 9) IS usable by a Devourer DH (1480, INT) — the usability
+  -- gate the Shaman failed. DH warglaives are dual-wield ("both" hands), so with
+  -- an empty off-hand the drop fills slot 17 (compare vs the empty slot, ilvl 0).
+  local guid = "Player-0-DHWarglaive"
+  mockMemberGear(guid, "party1", "DEMONHUNTER", 1480, { [16] = 450 })
+  local link = "item:warglaive_dh"
+  _mockItemStats[link] = { ITEM_MOD_INTELLECT_SHORT = 200 }
+  local itemData = { link = link, ilvl = 470, equipLoc = "INVTYPE_WEAPON",
+                     classID = 2, subID = 9, slotIDs = {16}, slotCategory = "weapon",
+                     weaponSubID = 9, primaryStats = { INT = true } }
+  local eligible, cand, reason = checkMember(guid, itemData, 10)
+  lu.assertTrue(eligible, "warglaive usable by Devourer DH with matching INT")
+  lu.assertEquals(reason, "eligible")
+  lu.assertEquals(cand.slotID, 17, "dual-wielder fills the empty off-hand")
+  lu.assertEquals(cand.ilvl_current, 0)
+  lu.assertEquals(cand.delta, 470)
+end
+
+function TestMemberEligibility:test_weapon_unknown_subid_not_usable()
+  -- Unknown weapon subID 99 → SpecWeaponHands nil (D-03 fail-safe) → not usable.
+  local guid = "Player-0-UnknownSubID"
+  mockMemberGear(guid, "party1", "WARRIOR", 72, { [16] = 450 })
+  local link = "item:unknown_weapon"
+  _mockItemStats[link] = { ITEM_MOD_AGILITY_SHORT = 150 }
+  local itemData = { link = link, ilvl = 470, equipLoc = "INVTYPE_WEAPON",
+                     classID = 2, subID = 99, slotIDs = {16}, slotCategory = "weapon",
+                     weaponSubID = 99, primaryStats = { AGI = true } }
+  local eligible, cand, reason = checkMember(guid, itemData, 10)
+  lu.assertFalse(eligible, "unknown weapon subID fails closed")
+  lu.assertNil(cand)
+  lu.assertStrContains(reason, "weapon not usable by spec")
+end
+
+function TestMemberEligibility:test_weaponoffhand_targets_slot17()
+  -- WEAPONOFFHAND dagger (Assassination Rogue 259): must compare slot 17 (460),
+  -- not slot 16 (490) — regression lock CR-02.
+  local guid = "Player-0-WOHRogue"
+  mockMemberGear(guid, "party1", "ROGUE", 259, { [16] = 490, [17] = 460 })
+  local link = "item:woh_dagger_member"
+  _mockItemStats[link] = { ITEM_MOD_AGILITY_SHORT = 150 }
+  local itemData = { link = link, ilvl = 490, equipLoc = "INVTYPE_WEAPONOFFHAND",
+                     classID = 2, subID = 15, slotIDs = {17}, slotCategory = "weapon",
+                     weaponSubID = 15, primaryStats = { AGI = true } }
+  local eligible, cand, reason = checkMember(guid, itemData, 10)
+  lu.assertTrue(eligible, "off-hand dagger beats the weaker off-hand")
+  lu.assertEquals(reason, "eligible")
+  lu.assertEquals(cand.slotID, 17, "must target slot 17, not 16")
+  lu.assertEquals(cand.ilvl_current, 460)
+  lu.assertEquals(cand.delta, 30)
+end
+
+-- ---------- AUD-401: WEAPONOFFHAND drop (hands=="off") vs an equipped 2H ----------
+-- Frost DK/Survival/BrM/WW list a 1H subID in offHandWeapon, so an
+-- INVTYPE_WEAPONOFFHAND drop resolves hands=="off" (weaponSlot 17, no dual compare).
+-- When the spec is currently on a 2H, slot 17 is empty ONLY because the 2H fills
+-- both hands — the real basis is the 2H (slot 16), not an ilvl-0 empty off-hand.
+
+function TestMemberEligibility:test_weaponoffhand_vs_equipped_2h_straight_compare_skip()
+  -- Frost DK (251, STR) on a 2H @400, empty off-hand. A WEAPONOFFHAND axe @100 must
+  -- compare STRAIGHT vs the 2H (slot 16) — not the empty off-hand — so it's no upgrade.
+  local guid = "Player-0-FrostDKWOH2H"
+  mockMemberGear(guid, "party1", "DEATHKNIGHT", 251, { [16] = 400 })  -- OH empty
+  equipMember2H(guid, 400)
+  local link = "item:woh_axe_fdk_low"
+  _mockItemStats[link] = { ITEM_MOD_STRENGTH_SHORT = 200 }
+  local itemData = { link = link, ilvl = 100, equipLoc = "INVTYPE_WEAPONOFFHAND",
+                     classID = 2, subID = 0, slotIDs = {17}, slotCategory = "weapon",
+                     weaponSubID = 0, primaryStats = { STR = true } }
+  local eligible, cand, reason = checkMember(guid, itemData, 10)
+  lu.assertFalse(eligible, "WEAPONOFFHAND @100 vs an equipped 2H @400 is not an upgrade")
+  lu.assertNil(cand)
+  lu.assertEquals(reason, "ilvl")
+end
+
+function TestMemberEligibility:test_weaponoffhand_vs_equipped_2h_straight_compare_eligible()
+  -- Same Frost DK on a 2H @400: a WEAPONOFFHAND axe @405 clears +5 straight vs the
+  -- 2H (slot 16) → eligible, delta 5 (NOT delta 405 against an empty off-hand).
+  local guid = "Player-0-FrostDKWOH2HUp"
+  mockMemberGear(guid, "party1", "DEATHKNIGHT", 251, { [16] = 400 })  -- OH empty
+  equipMember2H(guid, 400)
+  local link = "item:woh_axe_fdk_up"
+  _mockItemStats[link] = { ITEM_MOD_STRENGTH_SHORT = 210 }
+  local itemData = { link = link, ilvl = 405, equipLoc = "INVTYPE_WEAPONOFFHAND",
+                     classID = 2, subID = 0, slotIDs = {17}, slotCategory = "weapon",
+                     weaponSubID = 0, primaryStats = { STR = true } }
+  local eligible, cand, reason = checkMember(guid, itemData, 1)
+  lu.assertTrue(eligible, "WEAPONOFFHAND @405 straight-beats the equipped 2H @400")
+  lu.assertEquals(reason, "eligible")
+  lu.assertEquals(cand.slotID, 16, "compare against the 2H in slot 16, not the empty off-hand")
+  lu.assertEquals(cand.ilvl_current, 400)
+  lu.assertEquals(cand.delta, 5)
+end
+
+function TestMemberEligibility:test_weaponoffhand_coldcache_mh_fails_closed()
+  -- Cold cache (M1): main-hand link present but equipLoc nil, empty off-hand. A
+  -- WEAPONOFFHAND drop must fail closed — a real 2H can't be confirmed, so comparing
+  -- vs the ilvl-0 empty off-hand would false-positive.
+  local guid = "Player-0-FrostDKWOHCold"
+  mockMemberGear(guid, "party1", "DEATHKNIGHT", 251, { [16] = 400 })  -- OH empty
+  local member = LIF.Cache.GetMember(guid)
+  member.gear[16] = { link = "item:fdk_woh_cold_mh", ilvl = 400, equipLoc = nil }
+  local link = "item:woh_axe_fdk_cold"
+  _mockItemStats[link] = { ITEM_MOD_STRENGTH_SHORT = 200 }
+  local itemData = { link = link, ilvl = 405, equipLoc = "INVTYPE_WEAPONOFFHAND",
+                     classID = 2, subID = 0, slotIDs = {17}, slotCategory = "weapon",
+                     weaponSubID = 0, primaryStats = { STR = true } }
+  local eligible, cand, reason = checkMember(guid, itemData, 1)
+  lu.assertFalse(eligible, "unresolved main-hand type + empty off-hand must fail closed")
+  lu.assertNil(cand)
+  lu.assertEquals(reason, "main-hand type unresolved")
+end
+
+function TestMemberEligibility:test_weaponoffhand_outlaw_empty_oh_no_2h_still_eligible()
+  -- Non-regression: Outlaw (260, AGI) has a 1H main hand and an EMPTY off-hand (no
+  -- 2H possible). A WEAPONOFFHAND dagger fills the empty off-hand → still eligible
+  -- against it (is2HEquipped false → falls through to the slot-17 empty compare).
+  local guid = "Player-0-OutlawWOHEmptyOH"
+  mockMemberGear(guid, "party1", "ROGUE", 260, { [16] = 490 })  -- 1H MH (default equipLoc), OH empty
+  local link = "item:woh_dagger_outlaw_fill"
+  _mockItemStats[link] = { ITEM_MOD_AGILITY_SHORT = 150 }
+  local itemData = { link = link, ilvl = 470, equipLoc = "INVTYPE_WEAPONOFFHAND",
+                     classID = 2, subID = 15, slotIDs = {17}, slotCategory = "weapon",
+                     weaponSubID = 15, primaryStats = { AGI = true } }
+  local eligible, cand, reason = checkMember(guid, itemData, 10)
+  lu.assertTrue(eligible, "Outlaw fills its empty off-hand with a WEAPONOFFHAND drop")
+  lu.assertEquals(reason, "eligible")
+  lu.assertEquals(cand.slotID, 17, "targets the empty off-hand it fills")
+  lu.assertEquals(cand.ilvl_current, 0)
+  lu.assertEquals(cand.delta, 470)
+end
+
+function TestMemberEligibility:test_self_weaponoffhand_vs_equipped_2h_not_upgrade()
+  -- Player mirror: local Frost DK on a 2H @400, empty off-hand. A WEAPONOFFHAND axe
+  -- @100 must NOT read as a self-upgrade (it would if compared vs the empty off-hand),
+  -- otherwise forwarding is wrongly suppressed and a bogus "+100 ilvl" line is sent.
+  _mockGetSpecialization = 1
+  _mockSpecializationInfo[1] = 251
+  _mockUnitClass["player"] = { "Death Knight", "DEATHKNIGHT" }
+  local slot16Link = "item:self_fdk_2h_woh"
+  _mockItemInfo[slot16Link] = { "TwoHandBlade", nil, 4, 400, nil,
+    "Weapon", "Two-Handed Swords", nil, "INVTYPE_2HWEAPON", nil, nil, 2, 8, 0 }
+  _mockIlvl[slot16Link] = 400
+  _mockGearLinks["player"] = { [16] = slot16Link }  -- OH empty
+  local link = "item:self_fdk_woh_low"
+  _mockItemStats[link] = { ITEM_MOD_STRENGTH_SHORT = 200 }
+  local itemData = { link = link, ilvl = 100, equipLoc = "INVTYPE_WEAPONOFFHAND",
+                     classID = 2, subID = 0, slotIDs = {17}, slotCategory = "weapon",
+                     weaponSubID = 0, primaryStats = { STR = true } }
+  lu.assertFalse(callIsPlayerUpgrade(itemData, 10),
+    "WEAPONOFFHAND @100 vs the player's own 2H @400 is not a self-upgrade")
+end
+
+-- ---------- weapon: Fury Titan's-Grip dual-slot 2H (min of both hands) ----------
+
+function TestMemberEligibility:test_fury_2h_dual_slot_eligible()
+  -- Fury Warrior (72): a 2H compares against min(slot16=460, slot17=455)=455.
+  local guid = "Player-0-Fury2H"
+  mockMemberGear(guid, "party1", "WARRIOR", 72, { [16] = 460, [17] = 455 })
+  local link = "item:2h_axe_fury"
+  _mockItemStats[link] = { ITEM_MOD_STRENGTH_SHORT = 300 }
+  local itemData = { link = link, ilvl = 470, equipLoc = "INVTYPE_2HWEAPON",
+                     classID = 2, subID = 1, slotIDs = {16, 17}, slotCategory = "weapon",
+                     weaponSubID = 1, primaryStats = { STR = true } }
+  local eligible, cand, reason = checkMember(guid, itemData, 10)
+  lu.assertTrue(eligible, "2H beats the lower of both Titan's-Grip hands")
+  lu.assertEquals(reason, "eligible")
+  lu.assertEquals(cand.slotID, 17)
+  lu.assertEquals(cand.ilvl_current, 455)
+  lu.assertEquals(cand.delta, 15)
+end
+
+function TestMemberEligibility:test_fury_2h_dual_slot_below_threshold()
+  -- Fury Warrior (72): 2H drop @460 vs min(455,458)=455 → delta 5 < 10 → ilvl skip.
+  local guid = "Player-0-Fury2HLow"
+  mockMemberGear(guid, "party1", "WARRIOR", 72, { [16] = 455, [17] = 458 })
+  local link = "item:2h_axe_fury_low"
+  _mockItemStats[link] = { ITEM_MOD_STRENGTH_SHORT = 280 }
+  local itemData = { link = link, ilvl = 460, equipLoc = "INVTYPE_2HWEAPON",
+                     classID = 2, subID = 1, slotIDs = {16, 17}, slotCategory = "weapon",
+                     weaponSubID = 1, primaryStats = { STR = true } }
+  local eligible, cand, reason = checkMember(guid, itemData, 10)
+  lu.assertFalse(eligible, "2H delta below threshold")
+  lu.assertNil(cand)
+  lu.assertEquals(reason, "ilvl")
+end
+
+-- ---------- offhand: usability, stat gate, heirloom, ilvl, cross-config ----------
+
+function TestMemberEligibility:test_offhand_holdable_usable()
+  -- Holdable usable by Affliction Warlock (265); slot 17 @450, drop 470 → eligible.
+  local guid = "Player-0-WarlockHold"
+  mockMemberGear(guid, "party1", "WARLOCK", 265, { [17] = 450 })
+  local itemData = { link = "item:holdable_warlock", ilvl = 470, equipLoc = "INVTYPE_HOLDABLE",
+                     classID = 4, subID = 0, slotIDs = {17}, slotCategory = "offhand", offhandSubID = 0 }
+  local eligible, cand, reason = checkMember(guid, itemData, 10)
+  lu.assertTrue(eligible, "holdable usable by a Warlock")
+  lu.assertEquals(reason, "eligible")
+  lu.assertEquals(cand.slotID, 17)
+  lu.assertEquals(cand.ilvl_current, 450)
+  lu.assertEquals(cand.delta, 20)
+end
+
+function TestMemberEligibility:test_offhand_holdable_not_usable_by_warrior()
+  -- No Arms Warrior (71) spec lists holdable → not usable.
+  local guid = "Player-0-WarriorHold"
+  mockMemberGear(guid, "party1", "WARRIOR", 71, { [17] = 450 })
+  local itemData = { link = "item:holdable_warrior", ilvl = 470, equipLoc = "INVTYPE_HOLDABLE",
+                     classID = 4, subID = 0, slotIDs = {17}, slotCategory = "offhand", offhandSubID = 0 }
+  local eligible, cand, reason = checkMember(guid, itemData, 10)
+  lu.assertFalse(eligible, "Arms Warrior cannot use a holdable")
+  lu.assertNil(cand)
+  lu.assertStrContains(reason, "offhand not usable by spec")
+end
+
+function TestMemberEligibility:test_offhand_shield_usable_by_prot_warrior()
+  -- Shield usable by Protection Warrior (73); slot 17 @450, drop 470 → eligible.
+  local guid = "Player-0-WarriorShield"
+  mockMemberGear(guid, "party1", "WARRIOR", 73, { [17] = 450 })
+  local itemData = { link = "item:shield_warrior", ilvl = 470, equipLoc = "INVTYPE_SHIELD",
+                     classID = 4, subID = 6, slotIDs = {17}, slotCategory = "offhand", offhandSubID = 6 }
+  local eligible, cand, reason = checkMember(guid, itemData, 10)
+  lu.assertTrue(eligible, "shield usable by Protection Warrior")
+  lu.assertEquals(reason, "eligible")
+  lu.assertEquals(cand.slotID, 17)
+  lu.assertEquals(cand.ilvl_current, 450)
+  lu.assertEquals(cand.delta, 20)
+end
+
+function TestMemberEligibility:test_offhand_shield_not_usable_by_mage()
+  -- No Fire Mage (63) spec lists shield → not usable.
+  local guid = "Player-0-MageShield"
+  mockMemberGear(guid, "party1", "MAGE", 63, { [17] = 450 })
+  local itemData = { link = "item:shield_mage", ilvl = 470, equipLoc = "INVTYPE_SHIELD",
+                     classID = 4, subID = 6, slotIDs = {17}, slotCategory = "offhand", offhandSubID = 6 }
+  local eligible, cand, reason = checkMember(guid, itemData, 10)
+  lu.assertFalse(eligible, "Mage cannot use a shield")
+  lu.assertNil(cand)
+  lu.assertStrContains(reason, "offhand not usable by spec")
+end
+
+function TestMemberEligibility:test_offhand_ilvl_below_threshold()
+  -- Usable holdable, but slot 17 @465 vs drop 470 → delta 5 < 10 → ilvl skip.
+  local guid = "Player-0-WarlockLow"
+  mockMemberGear(guid, "party1", "WARLOCK", 265, { [17] = 465 })
+  local itemData = { link = "item:holdable_low", ilvl = 470, equipLoc = "INVTYPE_HOLDABLE",
+                     classID = 4, subID = 0, slotIDs = {17}, slotCategory = "offhand", offhandSubID = 0 }
+  local eligible, cand, reason = checkMember(guid, itemData, 10)
+  lu.assertFalse(eligible, "offhand delta below threshold")
+  lu.assertNil(cand)
+  lu.assertEquals(reason, "ilvl")
+end
+
+function TestMemberEligibility:test_offhand_stat_mismatch()
+  -- Offhand stat gate: an INT shield vs a STR spec (Protection Paladin 66) is
+  -- rejected on the stat even though the slot is far below the drop's ilvl. Uses
+  -- a shield (usable by Prot Paladin) so the stat gate is actually reached — the
+  -- old test used a holdable, which a Paladin can't equip at all, so it hit the
+  -- usability gate instead and never exercised the stat gate (AUD-311).
+  local guid = "Player-0-ProtPalaShield"
+  mockMemberGear(guid, "party1", "PALADIN", 66, { [17] = 100 })
+  local link = "item:shield_int_stat"
+  _mockItemStats[link] = { ITEM_MOD_INTELLECT_SHORT = 200 }
+  local itemData = { link = link, ilvl = 470, equipLoc = "INVTYPE_SHIELD",
+                     classID = 4, subID = 6, slotIDs = {17}, slotCategory = "offhand",
+                     offhandSubID = 6, primaryStats = { INT = true } }
+  local eligible, cand, reason = checkMember(guid, itemData, 10)
+  lu.assertFalse(eligible, "INT shield not usable by a STR spec")
+  lu.assertNil(cand)
+  lu.assertEquals(reason, "stat mismatch (INT/STR)")
+end
+
+function TestMemberEligibility:test_offhand_stat_match()
+  -- INT holdable vs an INT spec (Affliction Warlock 265) → stat gate passes.
+  local guid = "Player-0-WarlockStat"
+  mockMemberGear(guid, "party1", "WARLOCK", 265, { [17] = 100 })
+  local link = "item:holdable_int_match"
+  _mockItemStats[link] = { ITEM_MOD_INTELLECT_SHORT = 200 }
+  local itemData = { link = link, ilvl = 470, equipLoc = "INVTYPE_HOLDABLE",
+                     classID = 4, subID = 0, slotIDs = {17}, slotCategory = "offhand",
+                     offhandSubID = 0, primaryStats = { INT = true } }
+  local eligible, cand, reason = checkMember(guid, itemData, 10)
+  lu.assertTrue(eligible, "INT holdable usable by an INT spec")
+  lu.assertEquals(reason, "eligible")
+  lu.assertEquals(cand.slotID, 17)
+  lu.assertEquals(cand.ilvl_current, 100)
+  lu.assertEquals(cand.delta, 370)
+end
+
+function TestMemberEligibility:test_offhand_heirloom_slot_excludes()
+  -- Active heirloom holdable in slot 17 at level 50 → excluded regardless of ilvl.
+  local guid = "Player-0-OffhandHeirloom"
+  _mockGuids["party1"] = guid
+  _mockUnitClass["party1"] = { "Warlock", "WARLOCK" }
+  _mockUnitLevel["party1"] = 50
+  _mockHeirloomItemIDs[33301] = true
+  _mockIlvl["item:33301"] = 300
+  LIF.Cache.Add(guid)
+  LIF.Cache.SetComplete(guid, { gear = { [17] = { link = "item:33301", ilvl = 300 } }, specID = 265 })
+  local itemData = { link = "item:holdable_heirloom", ilvl = 470, equipLoc = "INVTYPE_HOLDABLE",
+                     classID = 4, subID = 0, slotIDs = {17}, slotCategory = "offhand", offhandSubID = 0 }
+  local eligible, cand, reason = checkMember(guid, itemData, 10)
+  lu.assertFalse(eligible, "active heirloom off-hand is unbeatable")
+  lu.assertNil(cand)
+  lu.assertEquals(reason, "heirloom")
+end
+
+function TestMemberEligibility:test_offhand_vs_2h_straight_across()
+  -- Warlock on a 2H staff @460 (cross-config D-16): a holdable @470 out-ilvls it
+  -- straight across (they could switch to 1H+holdable) → eligible vs slot 16.
+  local guid = "Player-0-Warlock2H"
+  mockMemberGear(guid, "party1", "WARLOCK", 265, { [16] = 460 })
+  LIF.Cache.GetMember(guid).gear[16].equipLoc = "INVTYPE_2HWEAPON"
+  local itemData = { link = "item:holdable_2h_gate", ilvl = 470, equipLoc = "INVTYPE_HOLDABLE",
+                     classID = 4, subID = 0, slotIDs = {17}, slotCategory = "offhand", offhandSubID = 0 }
+  local eligible, cand, reason = checkMember(guid, itemData, 10)
+  lu.assertTrue(eligible, "holdable beats the equipped 2H straight across")
+  lu.assertEquals(reason, "eligible")
+  lu.assertEquals(cand.slotID, 16)
+  lu.assertEquals(cand.ilvl_current, 460)
+  lu.assertEquals(cand.delta, 10)
+end
+
+function TestMemberEligibility:test_offhand_no_slot16_no_2h_gate()
+  -- No slot 16 equipped → 2H gate skipped → normal off-hand compare (slot 17 @450).
+  local guid = "Player-0-WarlockNoMH"
+  mockMemberGear(guid, "party1", "WARLOCK", 265, { [17] = 450 })
+  local itemData = { link = "item:holdable_no_mh", ilvl = 470, equipLoc = "INVTYPE_HOLDABLE",
+                     classID = 4, subID = 0, slotIDs = {17}, slotCategory = "offhand", offhandSubID = 0 }
+  local eligible, cand, reason = checkMember(guid, itemData, 10)
+  lu.assertTrue(eligible, "empty main hand skips the 2H gate")
+  lu.assertEquals(reason, "eligible")
+  lu.assertEquals(cand.slotID, 17)
+  lu.assertEquals(cand.ilvl_current, 450)
+  lu.assertEquals(cand.delta, 20)
+end
+
+function TestMemberEligibility:test_offhand_usability_gate_precedes_cross_config()
+  -- Protection Paladin (66, shield-only off-hand) wielding a 2H: a holdable is
+  -- never usable, so the usability gate rejects before the D-16 ilvl compare.
+  local guid = "Player-0-Pala2HGate"
+  mockMemberGear(guid, "party1", "PALADIN", 66, { [16] = 460 })
+  local slot16Link = "item:Player-0-Pala2HGates16"
+  _mockItemInfo[slot16Link] = { "Ashkandur", nil, 4, 460, nil,
+    "Weapon", "Two-Handed Swords", nil, "INVTYPE_2HWEAPON", nil, nil, 2, 8, 0 }
+  local itemData = { link = "item:holdable_d16_gate", ilvl = 470, equipLoc = "INVTYPE_HOLDABLE",
+                     classID = 4, subID = 0, slotIDs = {17}, slotCategory = "offhand", offhandSubID = 0 }
+  local eligible, cand, reason = checkMember(guid, itemData, 10)
+  lu.assertFalse(eligible, "shield-only spec rejected for a holdable before cross-config")
+  lu.assertNil(cand)
+  lu.assertStrContains(reason, "offhand not usable by spec")
+end
+
+-- ============================================================
+-- AUD-404: LIF.PlayerWeaponCompareSlot — the popup header hover's weapon
+-- compare slot must mirror the slot eligibility actually used for the player
+-- (weaker of a dual-wield pair / off-hand-only / the equipped 2H), not always
+-- the main hand.
+-- ============================================================
+TestPlayerWeaponCompareSlot = {}
+
+function TestPlayerWeaponCompareSlot:setUp()
+  ResetMocks()
+  _mockUnitClass["player"] = { "Death Knight", "DEATHKNIGHT" }
+  _mockUnitLevel["player"] = 70
+  _mockGetSpecialization = 1
+  _mockSpecializationInfo[1] = 251  -- Frost DK: 2H or dual 1H
+end
+
+-- Equip the player's weapon slots: gear = { [slot] = {ilvl=, equipLoc=, heirloomID=} }.
+local function equipPlayerWeapons(gear)
+  _mockGearLinks["player"] = {}
+  for slot, g in pairs(gear) do
+    local link = "item:player_w" .. slot
+    _mockGearLinks["player"][slot] = link
+    _mockIlvl[link] = g.ilvl
+    _mockItemInfo[link] = { "W", nil, 4, g.ilvl, nil, "Weapon", "Swords",
+      nil, g.equipLoc or "INVTYPE_WEAPON", nil, nil, 2, 7, 0 }
+    if g.heirloomID then
+      _mockItemInfo[link][1] = "H"
+      _mockGearLinks["player"][slot] = "item:" .. g.heirloomID
+      _mockIlvl["item:" .. g.heirloomID] = g.ilvl
+      _mockItemInfo["item:" .. g.heirloomID] = { "H", nil, 4, g.ilvl, nil, "Weapon",
+        "Swords", nil, g.equipLoc or "INVTYPE_WEAPON", nil, nil, 2, 7, 0 }
+      _mockHeirloomItemIDs[g.heirloomID] = true
+    end
+  end
+end
+
+local function sword1H() return { link = "item:drop_1h", equipLoc = "INVTYPE_WEAPON",
+  weaponSubID = 7, slotIDs = {16}, slotCategory = "weapon" } end
+
+function TestPlayerWeaponCompareSlot:test_dual_wield_returns_lower_ilvl_slot()
+  -- Dual 1H: MH 460 / OH 455 → compare against the weaker off-hand (17).
+  equipPlayerWeapons({ [16] = { ilvl = 460 }, [17] = { ilvl = 455 } })
+  lu.assertEquals(LIF.PlayerWeaponCompareSlot(sword1H()), 17,
+    "dual-wield header must show the weaker hand (off-hand @455)")
+end
+
+function TestPlayerWeaponCompareSlot:test_dual_wield_returns_lower_when_mainhand_weaker()
+  -- Dual 1H: MH 455 / OH 460 → compare against the weaker main hand (16).
+  equipPlayerWeapons({ [16] = { ilvl = 455 }, [17] = { ilvl = 460 } })
+  lu.assertEquals(LIF.PlayerWeaponCompareSlot(sword1H()), 16,
+    "dual-wield header shows the weaker hand (main @455)")
+end
+
+function TestPlayerWeaponCompareSlot:test_on_2h_empty_offhand_returns_mainhand()
+  -- Frost DK on a 2H (slot 16), empty off-hand → straight compare vs the 2H (16),
+  -- not the empty off-hand (AUD-301/AUD-401 mirrored in the header).
+  equipPlayerWeapons({ [16] = { ilvl = 400, equipLoc = "INVTYPE_2HWEAPON" } })
+  lu.assertEquals(LIF.PlayerWeaponCompareSlot(sword1H()), 16,
+    "on a 2H with empty off-hand, header shows the 2H (slot 16)")
+end
+
+function TestPlayerWeaponCompareSlot:test_offhand_only_drop_returns_offhand()
+  -- Outlaw off-hand-only dagger drop (hands=="off") with an occupied off-hand → slot 17.
+  _mockUnitClass["player"] = { "Rogue", "ROGUE" }
+  _mockSpecializationInfo[1] = 260  -- Outlaw
+  equipPlayerWeapons({ [16] = { ilvl = 490 }, [17] = { ilvl = 460 } })
+  local drop = { link = "item:drop_woh", equipLoc = "INVTYPE_WEAPONOFFHAND",
+    weaponSubID = 15, slotIDs = {17}, slotCategory = "weapon" }
+  lu.assertEquals(LIF.PlayerWeaponCompareSlot(drop), 17,
+    "off-hand-only drop compares against the off-hand (17)")
+end
+
+function TestPlayerWeaponCompareSlot:test_unusable_weapon_returns_nil()
+  -- A warglaive (DH-only subID 9) is not usable by Frost DK → nil (caller falls back).
+  equipPlayerWeapons({ [16] = { ilvl = 460 }, [17] = { ilvl = 455 } })
+  local drop = { link = "item:drop_wg", equipLoc = "INVTYPE_WEAPON",
+    weaponSubID = 9, slotIDs = {16}, slotCategory = "weapon" }
+  lu.assertNil(LIF.PlayerWeaponCompareSlot(drop),
+    "a weapon the spec can't use yields nil")
+end
+
+function TestPlayerWeaponCompareSlot:test_active_heirloom_hand_excluded()
+  -- Active heirloom in the main hand (level ≤69), non-heirloom off-hand @455 → the
+  -- heirloom hand never wins the low side, so compare against the off-hand (17).
+  _mockUnitLevel["player"] = 50
+  equipPlayerWeapons({ [16] = { ilvl = 300, heirloomID = 55501 }, [17] = { ilvl = 455 } })
+  lu.assertEquals(LIF.PlayerWeaponCompareSlot(sword1H()), 17,
+    "active heirloom main hand is excluded; compare the off-hand")
+end
+
+-- ============================================================
+-- Decision-logging formatters (verbose per-drop record). Pure-function tests
+-- of FormatDropHeader / FormatDecisionGear plus integration checks that the
+-- cmp / self-check / prefilter log lines carry class, spec, and equipped gear.
+-- ============================================================
+TestDecisionFormatters = {}
+
+function TestDecisionFormatters:setUp()
+  ResetMocks()
+end
+
+function TestDecisionFormatters:test_drop_header_2h_weapon()
+  local h = LIF.FormatDropHeader(
+    { name = "Test 2H", ilvl = 500, slotCategory = "weapon",
+      equipLoc = "INVTYPE_2HWEAPON", primaryStats = { STR = true } },
+    nil, 12345)
+  lu.assertStrContains(h, "ilvl=500")
+  lu.assertStrContains(h, "cat=weapon")
+  lu.assertStrContains(h, "hand=2h")
+  lu.assertStrContains(h, "stats=STR")
+  lu.assertStrContains(h, "id=12345")   -- nil link → id fallback
+end
+
+function TestDecisionFormatters:test_drop_header_statless_armor_no_hand()
+  local h = LIF.FormatDropHeader(
+    { name = "Plain Chest", ilvl = 200, slotCategory = "armor",
+      equipLoc = "INVTYPE_CHEST", primaryStats = nil },
+    nil, 999)
+  lu.assertStrContains(h, "stats=none")
+  lu.assertNil(h:find("hand=", 1, true), "armor drop has no hand= tag")
+end
+
+function TestDecisionFormatters:test_gear_ring_both_slots()
+  local char = {
+    level = 60,
+    getSlotIlvl     = function(s) return ({ [11] = 460, [12] = 475 })[s] or 0 end,
+    getLiveSlotIlvl = function(s) return 0 end,
+    getSlotLink     = function() return nil end,   -- nil link → isHeirloomActive false → hl:n
+    getLiveSlotLink = function() return nil end,
+  }
+  lu.assertEquals(
+    LIF.FormatDecisionGear(char, "ring", { slotIDs = { 11, 12 } }),
+    "s11:460 hl:n  s12:475 hl:n")
+end
+
+function TestDecisionFormatters:test_gear_weapon_uses_live_accessors_mh_oh()
+  local char = {
+    level = 60,
+    getSlotIlvl     = function(s) return 0 end,
+    getLiveSlotIlvl = function(s) return ({ [16] = 642, [17] = 0 })[s] or 0 end,
+    getSlotLink     = function() return nil end,
+    getLiveSlotLink = function() return nil end,
+  }
+  lu.assertEquals(
+    LIF.FormatDecisionGear(char, "weapon", {}),
+    "mh:642 hl:n  oh:0 hl:n")
+end
+
+function TestDecisionFormatters:test_gear_single_slot_armor()
+  local char = {
+    level = 60,
+    getSlotIlvl     = function(s) return ({ [5] = 630 })[s] or 0 end,
+    getLiveSlotIlvl = function(s) return 0 end,
+    getSlotLink     = function() return nil end,
+    getLiveSlotLink = function() return nil end,
+  }
+  lu.assertEquals(
+    LIF.FormatDecisionGear(char, "armor", { slotIDs = { 5 } }),
+    "s5:630 hl:n")
+end
+
+function TestDecisionFormatters:test_gear_heirloom_flag_y()
+  -- An active heirloom in the equipped slot (level ≤69) renders hl:y — exercises
+  -- isHeirloomActive(getLink(slot), char.level) with real link + level args.
+  local origGlobal = LootItForward
+  LootItForward = nil   -- isolate from any leaked skipHeirloomCheck bypass
+  _mockHeirloomItemIDs[55501] = true
+  local char = {
+    level = 50,
+    getSlotIlvl     = function(s) return ({ [5] = 120 })[s] or 0 end,
+    getLiveSlotIlvl = function(s) return 0 end,
+    getSlotLink     = function(s) return (s == 5) and "item:55501" or nil end,
+    getLiveSlotLink = function() return nil end,
+  }
+  local gear = LIF.FormatDecisionGear(char, "armor", { slotIDs = { 5 } })
+  LootItForward = origGlobal
+  lu.assertEquals(gear, "s5:120 hl:y")
+end
+
+function TestDecisionFormatters:test_self_check_log_enriched()
+  local origGlobal = LootItForward
+  LootItForward = { db = { char = { debugMode = true } } }
+  LIF.InitLog({ entries = {} }, "test")
+  -- Rogue (Leather, AGI): a leather chest drop @480 beats the equipped @460.
+  local link = "item:leather_chest_selfcheck"
+  mockItem(link, { "Chest", nil, 4, 480, nil, "Armor", "Leather", nil, "INVTYPE_CHEST", nil, nil, 4, 2, 0 })
+  _mockGuids["player"] = "GUID-SELF"
+  _mockUnitClass["player"] = { "Rogue", "ROGUE" }
+  _mockUnitLevel["player"] = 60
+  _mockGearLinks["player"] = { [5] = "item:player_chest_sc" }
+  _mockIlvl["item:player_chest_sc"] = 460
+  _mockGetSpecialization = 1
+  _mockSpecializationInfo[1] = 259  -- Assassination Rogue (AGI)
+
+  local itemData = LIF.ClassifyItem(link)
+  LIF.IsPlayerUpgrade(itemData, 1)
+  LootItForward = origGlobal
+
+  local found
+  for _, e in ipairs(LIF.GetLog()) do
+    if e.msg:find("^self%-check ") then found = e.msg end
+  end
+  lu.assertNotNil(found, "a self-check line was logged")
+  lu.assertStrContains(found, "ROGUE")
+  lu.assertStrContains(found, "equip=[s5:460")
+  lu.assertStrContains(found, "result=")
+end
+
+-- Member cmp-line enrichment: uses the existing TestMemberEligibility harness
+-- (checkMember helper + mockMemberGear), asserting the logged cmp line carries
+-- class, the both-slot gear summary, and the verdict on both paths.
+function TestMemberEligibility:test_cmp_log_enriched_eligible()
+  local origGlobal = LootItForward
+  LootItForward = { db = { char = { debugMode = true } } }
+  LIF.InitLog({ entries = {} }, "test")
+  local guid = "Player-0-CmpElig"
+  mockMemberGear(guid, "party1", "DRUID", 103, { [11] = 460, [12] = 475 })
+  local itemData = { link = "item:ring_cmp", ilvl = 470, equipLoc = "INVTYPE_FINGER",
+                     slotIDs = { 11, 12 }, slotCategory = "ring" }
+  checkMember(guid, itemData, 1)
+  LootItForward = origGlobal
+
+  local found
+  for _, e in ipairs(LIF.GetLog()) do
+    if e.msg:find("^cmp ") then found = e.msg end
+  end
+  lu.assertNotNil(found, "an eligible cmp line was logged")
+  lu.assertStrContains(found, "DRUID")            -- class token
+  lu.assertStrContains(found, "equip=[s11:460")   -- both-slot gear summary
+  lu.assertStrContains(found, "-> eligible")
+end
+
+function TestMemberEligibility:test_cmp_log_enriched_skip_has_gear()
+  local origGlobal = LootItForward
+  LootItForward = { db = { char = { debugMode = true } } }
+  LIF.InitLog({ entries = {} }, "test")
+  local guid = "Player-0-CmpSkip"
+  mockMemberGear(guid, "party1", "PALADIN", 70, { [11] = 150, [12] = 150 })
+  local itemData = { link = "item:int_ring_cmp", ilvl = 220, equipLoc = "INVTYPE_FINGER",
+                     slotIDs = { 11, 12 }, slotCategory = "ring", primaryStats = { INT = true } }
+  checkMember(guid, itemData, 1)
+  LootItForward = origGlobal
+
+  local found
+  for _, e in ipairs(LIF.GetLog()) do
+    if e.msg:find("^cmp ") then found = e.msg end
+  end
+  lu.assertNotNil(found, "a skip cmp line was logged")
+  lu.assertStrContains(found, "PALADIN")
+  lu.assertStrContains(found, "equip=[s11:150")   -- gear present even on the skip path
+  lu.assertStrContains(found, "-> skip(stat mismatch")
+end
+
+-- Prefilter-exclusion logging: a member dropped BEFORE reinspect must still
+-- log a "prefilter skip" line so the decision record shows who was considered.
+function TestMemberEligibility:test_prefilter_logs_excluded_member()
+  local origGlobal = LootItForward
+  LootItForward = { db = { char = { debugMode = true } } }
+  LIF.InitLog({ entries = {} }, "test")
+  -- A Mage (Cloth) cannot use a Plate armor drop → excluded at prefilter.
+  local guid = "Player-0-PrefMage"
+  mockMemberGear(guid, "party1", "MAGE", 64, { [5] = 100 })
+  local itemData = { link = "item:plate_chest_pref", ilvl = 200, equipLoc = "INVTYPE_CHEST",
+                     slotIDs = { 5 }, slotCategory = "armor", armorType = "Plate" }
+  LIF.EvaluateCandidates(itemData, 1)
+  LootItForward = origGlobal
+
+  local found
+  for _, e in ipairs(LIF.GetLog()) do
+    if e.msg:find("^prefilter skip ") then found = e.msg end
+  end
+  lu.assertNotNil(found, "an excluded member logs a prefilter-skip line")
+  lu.assertStrContains(found, "MAGE")
+  lu.assertStrContains(found, "armor type mismatch")
 end
 
 -- ============================================================

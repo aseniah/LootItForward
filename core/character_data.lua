@@ -1,10 +1,8 @@
 local _, LIF = ...
 
--- Primary stat, weapon/off-hand usability, and dual-wield now live per-spec in
--- LIF.SPEC_TABLE below (character-centric truth tables). The former
--- SPEC_PRIMARY_STAT, SPEC_DUAL_WIELD, and Hunter weapon-gate tables were folded
--- into it and removed. Verify SPEC_TABLE entries in-game via
--- GetSpecializationInfoByID(specID); re-verify after major patches.
+-- Primary stat, weapon/off-hand usability, and dual-wield are defined per-spec in
+-- LIF.SPEC_TABLE below (character-centric truth tables). Verify SPEC_TABLE entries
+-- in-game via GetSpecializationInfoByID(specID); re-verify after major patches.
 
 -- ============================================================
 -- CLASS_SPECS[classToken] = { specID, ... }
@@ -55,6 +53,13 @@ LIF.CLASS_SPECS = {
 --     and dropped the holdable (all specs dual-wield). Devourer (1480, INT caster)
 --     additionally gained the dagger skill in Midnight — INT daggers, both hands;
 --     Havoc/Vengeance stay dagger-incompatible (physical abilities need glaives/swords).
+--   * Warriors can physically equip daggers but no spec uses them functionally
+--     (dagger-scaling abilities are locked to Rogue / Devourer DH, and daggers
+--     only ever carry AGI or INT, never STR) — so subID 15 is omitted from every
+--     Warrior mainHand set. A real (AGI/INT) dagger drop is excluded for a STR
+--     spec by the primary-stat gate regardless; the omission just makes the
+--     truth table state it directly. Prot lists Fist (13) but not Dagger (15)
+--     for the same reason.
 --   * Rogues: Assassination & Subtlety are dagger-locked in BOTH hands; Outlaw's
 --     main-hand excludes daggers but its off-hand accepts any 1H. (Outlaw's
 --     main-hand dagger exclusion is a mechanical restriction — its strikes scale

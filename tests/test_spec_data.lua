@@ -1,5 +1,5 @@
 -- tests/test_spec_data.lua
--- Bidirectional completeness validation for core/spec_data.lua (D-07).
+-- Bidirectional completeness validation for the SPEC_TABLE in core/character_data.lua (D-07).
 -- Also covers core/armor_data.lua (REQ-test-coverage-offline).
 -- Run: lua tests/test_spec_data.lua  (from project root)
 
@@ -29,8 +29,8 @@ LoadAddonModules(LIF, _coreDir)
 local lu = require("luaunit")
 
 -- ============================================================
--- Ground truth: every retail spec as of WoW 11.x (Midnight expansion).
--- D-07: updating spec_data.lua for a new spec ALSO requires updating this table.
+-- Ground truth: every retail spec (Midnight).
+-- D-07: adding a spec to the SPEC_TABLE in character_data.lua ALSO requires updating this table.
 -- D-06: spec 1480 (Devourer DH) is INT, not AGI.
 -- ============================================================
 local EXPECTED = {
@@ -50,6 +50,16 @@ local EXPECTED = {
 }
 
 local VALID_STATS = { STR = true, AGI = true, INT = true }
+
+-- Legal weapon subIDs (classID 2) per the SPEC_TABLE header vocabulary:
+-- 0 1HAxe · 1 2HAxe · 2 Bow · 3 Gun · 4 1HMace · 5 2HMace · 6 Polearm ·
+-- 7 1HSword · 8 2HSword · 9 Warglaive · 10 Staff · 13 Fist · 15 Dagger ·
+-- 18 Crossbow · 19 Wand. Off-hand items (classID 4): 0 Holdable · 6 Shield.
+local VALID_WEAPON_SUBIDS = {
+  [0]=true,[1]=true,[2]=true,[3]=true,[4]=true,[5]=true,[6]=true,[7]=true,
+  [8]=true,[9]=true,[10]=true,[13]=true,[15]=true,[18]=true,[19]=true,
+}
+local VALID_OFFHAND_ITEM_SUBIDS = { [0]=true, [6]=true }
 
 -- ============================================================
 -- TestSpecData
@@ -121,6 +131,39 @@ function TestArmorData:test_all_classes_map_to_valid_armor_type()
     "HUNTER must map to Mail")
 end
 
+-- AUD-005: the production armor gate (loot.lua) compares itemData.armorType, drawn
+-- from SUBCLASS_ARMOR[subID], against LIF.ARMOR_TYPE[classToken] by RAW equality. The
+-- two vocabularies are authored independently in different files; if either drifts
+-- (e.g. "Plate" -> "PLATE" on one side), the gate always-mismatches and an entire
+-- armor class is silently dropped from every armor drop. This guards that the two
+-- value-sets stay identical — the actual drift the raw-equality gate is exposed to
+-- (the pre-existing test above only checks ARMOR_TYPE against a hardcoded literal,
+-- never against SUBCLASS_ARMOR).
+function TestArmorData:test_subclass_armor_and_armor_type_vocabularies_match()
+  local function valueSet(t)
+    local s = {}
+    for _, v in pairs(t) do s[v] = true end
+    return s
+  end
+  local VALID_ARMOR_TYPES = { Cloth = true, Leather = true, Mail = true, Plate = true }
+  local subclassSet = valueSet(LIF.SUBCLASS_ARMOR)
+  local classSet    = valueSet(LIF.ARMOR_TYPE)
+
+  for v in pairs(VALID_ARMOR_TYPES) do
+    lu.assertTrue(subclassSet[v] == true, ("SUBCLASS_ARMOR is missing armor type %q"):format(v))
+    lu.assertTrue(classSet[v] == true, ("ARMOR_TYPE is missing armor type %q"):format(v))
+  end
+  for v in pairs(subclassSet) do
+    lu.assertTrue(VALID_ARMOR_TYPES[v] == true, ("SUBCLASS_ARMOR has unexpected armor type %q"):format(v))
+    lu.assertTrue(classSet[v] == true,
+      ("armor type %q in SUBCLASS_ARMOR is absent from ARMOR_TYPE — the raw-equality gate would always mismatch"):format(v))
+  end
+  for v in pairs(classSet) do
+    lu.assertTrue(subclassSet[v] == true,
+      ("armor type %q in ARMOR_TYPE is absent from SUBCLASS_ARMOR — the raw-equality gate would always mismatch"):format(v))
+  end
+end
+
 -- ============================================================
 -- TestSpecTableConsistency
 -- Structural invariants for the per-spec truth table. Guards against the
@@ -150,6 +193,27 @@ function TestSpecTableConsistency:test_every_spec_entry_is_complete()
         lu.assertEquals(v, true,
           ("spec %d: %s[%s] must be literal true (positive-fact table)"):format(specID, field, tostring(k)))
       end
+    end
+  end
+end
+
+-- Every subID key must be a member of the legal vocabulary (AUD-012). Without
+-- this, a typo like [14] for dagger [15] or [11] for staff [10] passes every
+-- other test yet silently removes that weapon type from the spec (omission =
+-- not usable → missed candidate forever). Weapon fields draw from the classID-2
+-- vocabulary; offHandItem from the classID-4 {holdable, shield} pair.
+function TestSpecTableConsistency:test_every_subid_key_is_in_the_legal_vocabulary()
+  for specID, entry in pairs(LIF.SPEC_TABLE) do
+    for _, field in ipairs({ "mainHand", "offHandWeapon" }) do
+      for k in pairs(entry[field]) do
+        lu.assertTrue(VALID_WEAPON_SUBIDS[k] == true,
+          ("spec %d: %s has out-of-vocabulary weapon subID %s"):format(specID, field, tostring(k)))
+      end
+    end
+    for k in pairs(entry.offHandItem) do
+      lu.assertTrue(VALID_OFFHAND_ITEM_SUBIDS[k] == true,
+        ("spec %d: offHandItem has out-of-vocabulary subID %s (only 0 holdable / 6 shield)")
+          :format(specID, tostring(k)))
     end
   end
 end
@@ -186,6 +250,35 @@ function TestSpecTableConsistency:test_class_specs_and_spec_table_cover_same_spe
   for specID in pairs(LIF.SPEC_TABLE) do
     lu.assertNotNil(seen[specID],
       ("spec %d present in SPEC_TABLE but not in any CLASS_SPECS list"):format(specID))
+    -- SPEC_LABEL is a third parallel spec-keyed table; guard it against the
+    -- same drift (a spec resolving to a raw ID in the debug/chat label).
+    lu.assertNotNil(LIF.SPEC_LABEL[specID],
+      ("spec %d present in SPEC_TABLE but missing from SPEC_LABEL"):format(specID))
+  end
+  for specID in pairs(LIF.SPEC_LABEL) do
+    lu.assertNotNil(LIF.SPEC_TABLE[specID],
+      ("spec %d present in SPEC_LABEL but missing from SPEC_TABLE"):format(specID))
+  end
+end
+
+-- The three class-keyed tables (CLASS_SPECS, ARMOR_TYPE, CLASS_SHORT) must
+-- cover exactly the same set of class tokens. A drift — a class in one but not
+-- another — silently breaks the armor-type gate or the chat class label for
+-- that class, and no other test would catch an entire class going dark.
+function TestSpecTableConsistency:test_class_keyed_tables_cover_same_classes()
+  for classToken in pairs(LIF.CLASS_SPECS) do
+    lu.assertNotNil(LIF.ARMOR_TYPE[classToken],
+      ("class %s in CLASS_SPECS but missing from ARMOR_TYPE"):format(classToken))
+    lu.assertNotNil(LIF.CLASS_SHORT[classToken],
+      ("class %s in CLASS_SPECS but missing from CLASS_SHORT"):format(classToken))
+  end
+  for classToken in pairs(LIF.ARMOR_TYPE) do
+    lu.assertNotNil(LIF.CLASS_SPECS[classToken],
+      ("class %s in ARMOR_TYPE but missing from CLASS_SPECS"):format(classToken))
+  end
+  for classToken in pairs(LIF.CLASS_SHORT) do
+    lu.assertNotNil(LIF.CLASS_SPECS[classToken],
+      ("class %s in CLASS_SHORT but missing from CLASS_SPECS"):format(classToken))
   end
 end
 

@@ -2,6 +2,41 @@ local _, LIF = ...
 
 local frame, refreshTicker
 
+local DEBUG_WIDTH = 420   -- matches f:SetSize below
+local MIN_ONSCREEN = 40   -- px of the frame that must stay visible
+local TITLE_STRIP = 22    -- draggable title height; keep it within the screen
+
+-- Is a saved (x, y) actually on the current screen? Anchor is TOPLEFT against
+-- UIParent BOTTOMLEFT, so x is the left edge and y the top edge's height above the
+-- bottom. Positive-form comparisons so a NaN coord reads as off-screen. Mirrors the
+-- popup's _isOnScreen so both windows judge a saved position the same way.
+local function _isOnScreen(x, y)
+  if type(x) ~= "number" or type(y) ~= "number" then return false end
+  local w = UIParent:GetWidth() or 1024
+  local h = UIParent:GetHeight() or 768
+  local visibleW = math.min(x + DEBUG_WIDTH, w) - math.max(x, 0)
+  if not (visibleW >= MIN_ONSCREEN) then return false end
+  if not (y <= h and y >= TITLE_STRIP) then return false end
+  return true
+end
+
+-- Resolve the saved position, self-healing a corrupt/off-screen one: return its
+-- coords if valid AND on-screen, else CLEAR the stored value (so it stops
+-- persisting a lost point — the debug window used to rely only on the runtime
+-- SetClampedToScreen, leaving a bad save in place forever) and return nil so the
+-- caller centres. Matches the popup's _resolvePopupPosition self-heal.
+local function _resolveDebugPosition()
+  local pos = LootItForward and LootItForward.db and LootItForward.db.char.debugPosition
+  if pos and _isOnScreen(pos.x, pos.y) then
+    return pos.x, pos.y
+  end
+  if pos and LootItForward and LootItForward.db then
+    LootItForward.db.char.debugPosition = nil
+    LIF.Log("debug: saved position off-screen — re-centering")
+  end
+  return nil
+end
+
 local function _saveDebugPosition()
   local xOfs = frame:GetLeft() - UIParent:GetLeft()
   local yOfs = frame:GetTop() - UIParent:GetBottom()
@@ -14,10 +49,10 @@ end
 
 function LIF.Debug_RestorePosition()
   if not frame then return end
-  local pos = LootItForward and LootItForward.db and LootItForward.db.char.debugPosition
+  local x, y = _resolveDebugPosition()
   frame:ClearAllPoints()
-  if pos and pos.x and pos.y then
-    frame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", pos.x, pos.y)
+  if x and y then
+    frame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", x, y)
   else
     frame:SetPoint("CENTER")
   end
@@ -94,14 +129,15 @@ end
 
 local function createFrame()
   local f = CreateFrame("Frame", "LIFDebugFrame", UIParent, "BackdropTemplate")
-  f:SetSize(420, 264)
-  local pos = LootItForward and LootItForward.db and LootItForward.db.char.debugPosition
-  if pos and pos.x and pos.y then
-    f:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", pos.x, pos.y)
+  f:SetSize(DEBUG_WIDTH, 264)
+  local x, y = _resolveDebugPosition()
+  if x and y then
+    f:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", x, y)
   else
     f:SetPoint("CENTER")
   end
   f:SetMovable(true)
+  f:SetClampedToScreen(true)
   f:EnableMouse(true)
   f:SetScript("OnMouseDown", function(_, button)
     if button == "LeftButton" then f:StartMoving() end
@@ -185,6 +221,11 @@ local function showDebugWindow()
   if not frame then frame = createFrame() end
   frame:Show()
   frame:Raise()
+  -- Anchor AFTER Show: SetPoint on the freshly-created, still-hidden frame in
+  -- createFrame doesn't land (the centre/saved point resolves to a corner until the
+  -- frame is realized). Re-applying it here on the shown frame mirrors how ShowPopup
+  -- re-anchors post-populate, and self-heals an off-screen save via _resolveDebugPosition.
+  LIF.Debug_RestorePosition()
   refresh()
   if not refreshTicker then
     refreshTicker = C_Timer.NewTicker(3, refresh)
@@ -212,6 +253,6 @@ function LIF.SetDebugMode(enabled)
   else
     LIF.HideDebugWindow()
   end
-  DEFAULT_CHAT_FRAME:AddMessage("[LIF] debug mode " .. (enabled and "on" or "off"))
+  LIF.Print("debug mode " .. (enabled and "on" or "off"))
 end
 

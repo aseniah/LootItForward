@@ -1,42 +1,13 @@
 {
-  "Lua.runtime.version": "Lua 5.1",
-  "Lua.workspace.ignoreDir": ["libs", "tests"],
-  "Lua.diagnostics.globals": [
-    "LE_ITEM_BIND_ON_PICKUP",
-    "INSPECT_READY",
-    "GROUP_ROSTER_UPDATE",
-    "RAID_ROSTER_UPDATE",
-    "PLAYER_LOOT_ITEM",
-    "PLAYER_ENTERING_WORLD",
-    "PLAYER_REGEN_ENABLED",
-    "SlashCmdList",
-    "DEFAULT_CHAT_FRAME",
-    "ITEM_QUALITY_COLORS",
-    "RAID_CLASS_COLORS",
-    "ChatFrame_OpenChat",
-    "ShoppingTooltip1",
-    "ShoppingTooltip2",
-    "ChatEdit_InsertLink",
-    "SOUNDKIT",
-    "Settings",
-    "EditBox_ClearFocus",
-    "MinimalSliderWithSteppersMixin",
-    "CreateMinimalSliderFormatter",
-    "BIND_TRADE_TIME_REMAINING"
-  ],
-  "Lua.runtime.builtin": {
-    "basic": "disable",
-    "debug": "disable",
-    "io": "disable",
-    "math": "disable",
-    "os": "disable",
-    "package": "disable",
-    "string": "disable",
-    "table": "disable",
-    "utf8": "disable"
-  },
+  // Managed by the ketho.wow-api extension: on activation it strips any stale
+  // ketho.wow-api entry and re-adds the current version's path, so the pinned version
+  // here self-heals on update. Point at Annotations (the parent), NOT Annotations/Core —
+  // Core alone omits FrameXML, which is where Settings, SlashCmdList, DEFAULT_CHAT_FRAME
+  // and EditBox_ClearFocus are declared.
+  //
+  // Everything else lives in .luarc.json (editor-agnostic, and it takes precedence over
+  // these settings anyway — a second copy here would only drift).
   "Lua.workspace.library": [
-    "~/.vscode/extensions/ketho.wow-api-0.22.3/Annotations/Core"
-  ],
-  "Lua.type.weakUnionCheck": true
+    "~/.vscode/extensions/ketho.wow-api-0.22.3/Annotations"
+  ]
 }

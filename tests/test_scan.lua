@@ -156,6 +156,73 @@ function TestQueue:test_roster_diff_removes_departed()
 end
 
 -- ------------------------------------------------------------
+-- test_inspect_ready_departure_prunes_pending_loot (AUD-303)
+-- If a member's guid→unit mapping is gone by the time INSPECT_READY processes it,
+-- the guid is removed from cache on that path — but the pending-loot prune
+-- (scanningGuids clear + Loot_TryOpenPopup) previously lived ONLY in
+-- OnGroupRosterUpdate. If that roster fire hasn't run yet, the departed guid stays
+-- in scanningGuids and blocks the popup until the adaptive window expires. The
+-- prune must run on the OnInspectReady departure path too.
+-- ------------------------------------------------------------
+function TestQueue:test_inspect_ready_departure_prunes_pending_loot()
+  local guid = "Player-0-Gone"
+  LIF.Cache.Add(guid)  -- PENDING; no _mockGuids mapping → GuidToUnit(guid) == nil
+
+  local entry = {
+    itemData            = { link = "item:x", ilvl = 100, slotCategory = "armor" },
+    scanningGuids       = { [guid] = true },
+    confirmedCandidates = {},
+    popupOpened         = false,
+  }
+  LIF.pendingLootItems = { entry }
+
+  local opened = false
+  local origTryOpen = LIF.Loot_TryOpenPopup
+  LIF.Loot_TryOpenPopup = function(e) if e == entry then opened = true end end
+
+  LIF.OnInspectReady(guid)
+
+  LIF.Loot_TryOpenPopup = origTryOpen
+
+  lu.assertNil(entry.scanningGuids[guid],
+    "AUD-303: departed guid must be pruned from scanningGuids on the INSPECT_READY path")
+  lu.assertTrue(opened,
+    "AUD-303: pruning the last outstanding scan must trigger Loot_TryOpenPopup")
+end
+
+-- ------------------------------------------------------------
+-- test_start_next_inspect_departure_prunes_pending_loot (AUD-303)
+-- The queue-pop departure path (StartNextInspect finds a nil guid→unit) must prune
+-- pending loot too. Driven via RequestReinspect, which front-queues the guid and
+-- kicks StartNextInspect when nothing is in flight.
+-- ------------------------------------------------------------
+function TestQueue:test_start_next_inspect_departure_prunes_pending_loot()
+  local guid = "Player-0-GoneQueue"
+  LIF.Cache.Add(guid)  -- PENDING; no _mockGuids mapping → GuidToUnit(guid) == nil
+
+  local entry = {
+    itemData            = { link = "item:y", ilvl = 100, slotCategory = "armor" },
+    scanningGuids       = { [guid] = true },
+    confirmedCandidates = {},
+    popupOpened         = false,
+  }
+  LIF.pendingLootItems = { entry }
+
+  local opened = false
+  local origTryOpen = LIF.Loot_TryOpenPopup
+  LIF.Loot_TryOpenPopup = function(e) if e == entry then opened = true end end
+
+  LIF.RequestReinspect(guid)  -- currentlyInspecting is nil → kicks StartNextInspect
+
+  LIF.Loot_TryOpenPopup = origTryOpen
+
+  lu.assertNil(entry.scanningGuids[guid],
+    "AUD-303: departed guid must be pruned on the StartNextInspect (queue-pop) path")
+  lu.assertTrue(opened,
+    "AUD-303: queue-pop prune of the last scan must trigger Loot_TryOpenPopup")
+end
+
+-- ------------------------------------------------------------
 -- test_guid_stability_survives_slot_change (REQ-cache-key-by-guid)
 -- GUID-keyed cache must survive slot reassignment without data loss.
 -- ------------------------------------------------------------
@@ -565,6 +632,252 @@ function TestQueue:test_reassert_capped()
     "exactly MAX_REASSERTS (2) reasserts must be scheduled for 10 clobbers, not one-per-clobber")
 end
 
+-- ------------------------------------------------------------
+-- test_stale_reassert_does_not_fire_against_reinspect_of_same_guid (AUD-006)
+-- A clobber schedules a reassert for attempt N of guid G. If G is re-inspected
+-- (die → battle-rez within REASSERT_DELAY) before the reassert fires, the
+-- reassert guards only on guid — (currentlyInspecting == G) is true for the NEW
+-- attempt too — so it would re-issue a NotifyInspect against the newer inspect,
+-- burning a throttle credit. A generation guard (as L5 added for SCAN_TIMEOUT)
+-- must make the stale reassert a no-op.
+-- ------------------------------------------------------------
+function TestQueue:test_stale_reassert_does_not_fire_against_reinspect_of_same_guid()
+  _mockGuids["player"] = "GUID-SELF"
+  _mockGuids["party1"] = "Player-0-Reassert"
+  _mockGuids["raid5"]  = "GUID-OTHER"
+  local guid = setupParty1("Player-0-Reassert")
+  _mockGearLinks["party1"] = {}
+  for slotID = 1, 16 do
+    local link = "item:" .. (19000 + slotID)
+    _mockGearLinks["party1"][slotID] = link
+    _mockIlvl[link] = 300
+  end
+  _mockSpecID["party1"] = 256
+  _mockCanInspect["party1"] = true
+
+  callRosterUpdate()                   -- StartInspect(G): gen 1, SCAN_TIMEOUT#1 (idx 1)
+  if #_notifyInspectCalls == 0 then
+    lu.skip("OnGroupRosterUpdate does not start inspects yet (TODO)")
+  end
+  lu.assertEquals(LIF.GetDebugInfo().currentlyInspecting, guid, "precondition: inspecting G")
+
+  NotifyInspect("raid5")               -- foreign clobber → reassert scheduled (gen 1, idx 2)
+
+  LIF.OnInspectReady(guid)             -- 16 slots → COMPLETE, currentlyInspecting cleared
+  LIF.RequestReinspect(guid)           -- re-PENDING + StartInspect(G): gen 2 (SCAN_TIMEOUT#2 idx 3)
+  lu.assertEquals(LIF.GetDebugInfo().currentlyInspecting, guid,
+    "precondition: freshly re-inspecting G (generation 2)")
+
+  local callsBefore = #_notifyInspectCalls
+  -- Fire ONLY the stale gen-1 reassert (scheduled at index 2, after SCAN_TIMEOUT#1).
+  lu.assertTrue(FirePendingAfterCallbackAt(2), "precondition: a stale reassert was pending")
+  lu.assertEquals(#_notifyInspectCalls, callsBefore,
+    "stale reassert must not re-issue NotifyInspect against the newer inspect of the same guid (AUD-006)")
+end
+
+-- ------------------------------------------------------------
+-- test_timeout_requeue_dedups_against_pending_reinspect (AUD-007)
+-- A loot-time RequestReinspect front-inserts guid G while our own inspect of G
+-- is still in flight (the L8 no-interrupt path), so G is already queued. When
+-- the in-flight attempt times out, its requeue must not append a SECOND copy —
+-- the other two enqueue sites dedup; this one must too.
+-- ------------------------------------------------------------
+local function _countInScanQueue(g)
+  local n = 0
+  for _, q in ipairs(LIF.scanQueue) do if q == g then n = n + 1 end end
+  return n
+end
+
+function TestQueue:test_timeout_requeue_dedups_against_pending_reinspect()
+  local guid = setupParty1("Player-0-Dedup")
+  _mockGearLinks["party1"] = { [1] = "item:20001" }  -- partial → stays PENDING
+  _mockIlvl["item:20001"] = 300
+  _mockSpecID["party1"] = 256
+  _mockCanInspect["party1"] = true
+
+  callRosterUpdate()                   -- StartInspect(G): SCAN_TIMEOUT scheduled (idx 1)
+  if #_notifyInspectCalls == 0 then
+    lu.skip("OnGroupRosterUpdate does not start inspects yet (TODO)")
+  end
+  lu.assertEquals(LIF.GetDebugInfo().currentlyInspecting, guid, "precondition: inspecting G")
+
+  LIF.RequestReinspect(guid)           -- front-inserts G; does NOT interrupt (L8)
+  lu.assertEquals(_countInScanQueue(guid), 1, "precondition: G queued exactly once by the reinspect")
+
+  -- Fire the in-flight attempt's SCAN_TIMEOUT (guid+gen match). Without dedup it
+  -- appends a second G; StartNextInspect then re-pops one, leaving a stale copy.
+  lu.assertTrue(FirePendingAfterCallbackAt(1), "precondition: the SCAN_TIMEOUT was pending")
+  lu.assertEquals(_countInScanQueue(guid), 0,
+    "timeout requeue must not leave a duplicate G in the queue (AUD-007)")
+end
+
+function TestQueue:test_new_member_rejoin_does_not_duplicate_in_queue()
+  -- AUD-403: a member queued behind an in-flight inspect who leaves and rejoins
+  -- before their stale queue entry drains must not be enqueued twice. Departure
+  -- doesn't purge scanQueue, so the stale entry is still there on rejoin — the
+  -- new-member enqueue must dedup against it like the other append sites do.
+  _mockGuids["player"]  = "GUID-SELF"
+  _mockGuids["party1"]  = "Player-0-P1"
+  _mockGuids["party2"]  = "Player-0-P2"
+  _mockCanInspect["party1"] = true
+  _mockCanInspect["party2"] = true
+
+  callRosterUpdate()
+  if #_notifyInspectCalls == 0 then
+    lu.skip("OnGroupRosterUpdate does not start inspects yet (TODO)")
+  end
+  -- One member holds the inspect sentinel; the OTHER waits in the queue. Which is
+  -- which depends on pairs() order, so pick the queued (non-inspecting) member
+  -- dynamically rather than assuming — the test must not depend on iteration order.
+  local inspecting = LIF.GetDebugInfo().currentlyInspecting
+  local queuedGuid = (inspecting == "Player-0-P1") and "Player-0-P2" or "Player-0-P1"
+  local queuedUnit = (queuedGuid == "Player-0-P2") and "party2" or "party1"
+  lu.assertEquals(_countInScanQueue(queuedGuid), 1, "precondition: the queued member is in once")
+
+  -- The queued member leaves (departure removes it from the cache, not the queue).
+  _mockGuids[queuedUnit] = nil
+  callRosterUpdate()
+  lu.assertNil(LIF.Cache.GetMember(queuedGuid), "precondition: queued member removed from cache on leave")
+  lu.assertEquals(_countInScanQueue(queuedGuid), 1, "precondition: stale entry still in queue")
+
+  -- It rejoins before the stale entry drains (the other member is still inspecting).
+  _mockGuids[queuedUnit] = queuedGuid
+  callRosterUpdate()
+  lu.assertEquals(_countInScanQueue(queuedGuid), 1,
+    "new-member enqueue must dedup against the stale queue entry (AUD-403)")
+end
+
+-- ------------------------------------------------------------
+-- AUD-008: the death / disconnect / unit-nil abandonment paths drop
+-- currentlyInspecting but must ALSO ClearInspectPlayer() to release the shared
+-- inspect slot (courtesy), matching the teardown paths. With an empty queue the
+-- slot would otherwise stay held until the next NotifyInspect.
+-- ------------------------------------------------------------
+function TestQueue:test_mid_scan_death_releases_inspect_slot()
+  local guid = setupParty1("Player-0-Death")
+  callRosterUpdate()
+  if #_notifyInspectCalls == 0 then
+    lu.skip("OnGroupRosterUpdate does not start inspects yet (TODO)")
+  end
+  lu.assertEquals(LIF.GetDebugInfo().currentlyInspecting, guid, "precondition: inspecting G")
+
+  local before = _clearInspectCount
+  _mockIsDeadOrGhost["party1"] = true
+  LIF.OnUnitHealthChanged("party1")
+  lu.assertNil(LIF.GetDebugInfo().currentlyInspecting, "slot sentinel cleared on death")
+  lu.assertTrue(_clearInspectCount > before,
+    "death abandonment must ClearInspectPlayer to release the slot (AUD-008)")
+end
+
+-- ------------------------------------------------------------
+-- test_setcomplete_merges_absent_keys (AUD-013)
+-- SetComplete MERGES — a key absent from `data` keeps its previous value. This
+-- is the trap: a partial refresh that omits specID (e.g. a nil from the API,
+-- which drops the key from the table literal) would silently keep a stale spec.
+-- The sole caller normalizes specID to 0 so a lost spec is stored explicitly.
+-- ------------------------------------------------------------
+function TestQueue:test_setcomplete_merges_absent_keys()
+  local guid = "Player-0-Merge"
+  LIF.Cache.Add(guid)
+  LIF.Cache.SetComplete(guid, { specID = 256, ilvl = 300 })
+  lu.assertEquals(LIF.Cache.GetMember(guid).specID, 256, "precondition: spec stored")
+
+  -- Partial refresh WITHOUT specID → the stale spec persists (merge, not replace).
+  LIF.Cache.SetComplete(guid, { ilvl = 310 })
+  lu.assertEquals(LIF.Cache.GetMember(guid).specID, 256,
+    "SetComplete merges: an omitted specID keeps its previous value (the AUD-013 trap)")
+
+  -- Explicit specID (as the normalized call site passes) DOES replace it.
+  LIF.Cache.SetComplete(guid, { specID = 0 })
+  lu.assertEquals(LIF.Cache.GetMember(guid).specID, 0,
+    "an explicit specID (0 for a lost spec) overwrites the stale value")
+end
+
+-- ------------------------------------------------------------
+-- test_inspect_complete_normalizes_stale_specname (AUD-313)
+-- The specID resurrection is closed (AUD-013), but its sibling specName was left
+-- half-applied: GetSpecializationInfoByID(0) returns a nil name for a lost spec, so
+-- the key was omitted and SetComplete's merge kept the previous specName. A member
+-- who respecs into "no spec" (specID 0) would keep displaying their old spec name.
+-- The completion must pass a normalized specName so it overwrites, not merge-keeps.
+-- ------------------------------------------------------------
+function TestQueue:test_inspect_complete_normalizes_stale_specname()
+  local guid = setupParty1("Player-0-Respec")
+  _mockGearLinks["party1"] = {}
+  for slotID = 1, 16 do
+    local link = "item:" .. (13000 + slotID)
+    _mockGearLinks["party1"][slotID] = link
+    _mockIlvl[link] = 400
+  end
+  _mockSpecID["party1"] = 0   -- lost/unknown spec → GetSpecializationInfoByID(0) → nil name
+
+  callRosterUpdate()
+  if #_notifyInspectCalls == 0 then
+    lu.skip("OnGroupRosterUpdate does not start inspects yet (TODO)")
+  end
+
+  -- Simulate a stale spec name left from a prior COMPLETE inspect.
+  LIF.Cache.GetMember(guid).specName = "Frost"
+
+  LIF.OnInspectReady(guid)
+
+  lu.assertEquals(LIF.Cache.GetMember(guid).specName, "?",
+    "AUD-313: a completion with an unknown spec (0) must overwrite a stale specName, not merge-keep it")
+end
+
+-- ------------------------------------------------------------
+-- test_initlog_keeps_session_header_within_cap (AUD-314)
+-- InitLog trimmed to <= LOG_MAX and THEN appended the session header, overflowing
+-- to LOG_MAX+1. It must make room for the header so the buffer never exceeds the cap.
+-- ------------------------------------------------------------
+function TestQueue:test_initlog_keeps_session_header_within_cap()
+  local LOG_MAX = 500
+  local entries = {}
+  for i = 1, LOG_MAX do entries[i] = { t = "0", msg = "old " .. i } end
+
+  LIF.InitLog({ entries = entries }, "test")
+
+  lu.assertEquals(#LIF.GetLog(), LOG_MAX,
+    "AUD-314: InitLog must fit the session header within LOG_MAX, not overflow to 501")
+end
+
+-- ------------------------------------------------------------
+-- test_log_while_caps_oversized_buffer (AUD-314)
+-- LIF.Log removed only ONE entry per insert, so any excess above LOG_MAX (e.g. a
+-- legacy 501-entry SavedVariable, or the old InitLog overflow) never recovered. It
+-- must while-cap like RecordInspect.
+-- ------------------------------------------------------------
+function TestQueue:test_log_while_caps_oversized_buffer()
+  local LOG_MAX = 500
+  LIF.InitLog({ entries = {} }, "test")   -- logEntries = { header }
+  local log = LIF.GetLog()
+  for i = 1, LOG_MAX + 1 do table.insert(log, { t = "0", msg = "x" }) end  -- force oversized
+
+  local origGlobal = LootItForward
+  LootItForward = { db = { char = { debugMode = true } } }
+  LIF.Log("trigger")
+  LootItForward = origGlobal
+
+  lu.assertEquals(#LIF.GetLog(), LOG_MAX,
+    "AUD-314: a single Log insert must while-cap an oversized buffer back to LOG_MAX")
+end
+
+function TestQueue:test_mid_scan_disconnect_releases_inspect_slot()
+  local guid = setupParty1("Player-0-Disc")
+  callRosterUpdate()
+  if #_notifyInspectCalls == 0 then
+    lu.skip("OnGroupRosterUpdate does not start inspects yet (TODO)")
+  end
+  lu.assertEquals(LIF.GetDebugInfo().currentlyInspecting, guid, "precondition: inspecting G")
+
+  local before = _clearInspectCount
+  _mockIsConnected["party1"] = false
+  LIF.OnUnitDisconnect("party1")
+  lu.assertNil(LIF.GetDebugInfo().currentlyInspecting, "slot sentinel cleared on disconnect")
+  lu.assertTrue(_clearInspectCount > before,
+    "disconnect abandonment must ClearInspectPlayer to release the slot (AUD-008)")
+end
+
 -- ============================================================
 -- Scan reconciliation job (REV-006)
 -- Two-phase ticker: 5s base tick; fast phase acts on EVERY tick for 60s
@@ -659,6 +972,99 @@ function TestScanReconciliation:test_ticker_stops_when_all_complete()
     "job must stop once every member is COMPLETE (restarts on roster change/loot)")
 end
 
+function TestScanReconciliation:test_inspect_caches_equiploc_per_slot()
+  -- equipLoc is captured per slot at inspect time and stored in the snapshot so
+  -- eval never re-calls GetItemInfo live at loot time (M1).
+  local guid = setupParty1("Player-0-EquipLocCache")
+  _mockGearLinks["party1"] = {}
+  for slotID = 1, 16 do
+    local link = "item:" .. (16000 + slotID)
+    _mockGearLinks["party1"][slotID] = link
+    _mockIlvl[link] = 415
+  end
+  -- Slot 16 is a two-hander; its equipLoc must land in the cached snapshot.
+  _mockItemInfo["item:" .. (16000 + 16)] = { "Greatblade", nil, 4, 415, nil,
+    "Weapon", "Swords", nil, "INVTYPE_2HWEAPON", nil, nil, 2, 8, 0 }
+  _mockSpecID["party1"] = 72
+
+  callRosterUpdate()
+  LIF.OnInspectReady(guid)  -- 16 slots >= MIN_SLOTS → COMPLETE in one fire
+
+  local member = LIF.Cache.GetMember(guid)
+  lu.assertEquals(member.state, "COMPLETE", "16-slot read completes immediately")
+  lu.assertEquals(member.gear[16] and member.gear[16].equipLoc, "INVTYPE_2HWEAPON",
+    "equipLoc is cached per slot at inspect time (M1)")
+end
+
+function TestScanReconciliation:test_stabilization_pacing_floor_blocks_burst()
+  -- A foreign INSPECT_READY burst (multiple fires < MIN_HARVEST_SPACING apart)
+  -- must NOT fast-track a PARTIAL read to COMPLETE: slot data can't have grown
+  -- between fires that close, so 3 identical partial counts in a burst would
+  -- otherwise stabilize a member with missing slots (M7). Spaced fires still work.
+  local guid = setupParty1("Player-0-PacingBurst")
+  _mockGearLinks["party1"] = {}
+  for slotID = 1, 5 do                    -- 5-slot partial read (< MIN_SLOTS=14)
+    local link = "item:" .. (17000 + slotID)
+    _mockGearLinks["party1"][slotID] = link
+    _mockIlvl[link] = 200
+  end
+  _mockSpecID["party1"] = 256
+
+  callRosterUpdate()
+  _mockTime = 100
+
+  -- Burst: 5 identical partial fires all within 0.5s of each other.
+  for _ = 1, 5 do
+    LIF.OnInspectReady(guid)
+    _mockTime = _mockTime + 0.1           -- < 0.75 → must not advance the counter
+  end
+  lu.assertNotEquals(LIF.Cache.GetMember(guid).state, "COMPLETE",
+    "an unpaced burst of identical partial reads must not stabilize to COMPLETE")
+
+  -- Two adequately-spaced fires (≥0.75s from the last COUNTED fire, which is
+  -- still the very first one at t=100) advance the counter to 3 → COMPLETE.
+  _mockTime = _mockTime + 1               -- counted fire #2
+  LIF.OnInspectReady(guid)
+  _mockTime = _mockTime + 1               -- counted fire #3 → stabilized
+  LIF.OnInspectReady(guid)
+  lu.assertEquals(LIF.Cache.GetMember(guid).state, "COMPLETE",
+    "spaced partial reads still stabilize once 3 counted fires accumulate")
+end
+
+function TestScanReconciliation:test_stale_timeout_does_not_clobber_reinspect_of_same_guid()
+  -- L5: a member is inspected (timer T1 scheduled), completes, then a loot-time
+  -- reinspect starts a FRESH inspect of the SAME guid (timer T2) — the classic
+  -- die + battle-rez-within-2s shape. The stale T1 guards only on guid, so
+  -- (currentlyInspecting == guid) is true for BOTH attempts and T1 would
+  -- ClearInspectPlayer the newer in-flight inspect. A generation counter must
+  -- make T1 a no-op.
+  local guid = setupParty1("Player-0-StaleTimer")
+  _mockGearLinks["party1"] = {}
+  for slotID = 1, 16 do
+    local link = "item:" .. (18000 + slotID)
+    _mockGearLinks["party1"][slotID] = link
+    _mockIlvl[link] = 300
+  end
+  _mockSpecID["party1"] = 256
+  _mockCanInspect["party1"] = true
+
+  callRosterUpdate()                 -- StartInspect(G): T1 (gen 1)
+  lu.assertEquals(LIF.GetDebugInfo().currentlyInspecting, guid, "precondition: inspecting G")
+
+  LIF.OnInspectReady(guid)           -- 16 slots → COMPLETE, currentlyInspecting cleared
+  LIF.RequestReinspect(guid)         -- re-PENDING + StartInspect(G): T2 (gen 2)
+  lu.assertEquals(LIF.GetDebugInfo().currentlyInspecting, guid, "precondition: freshly re-inspecting G")
+
+  -- Fire ONLY the stale T1 (first pending After callback). It must not touch the
+  -- current (gen-2) inspect.
+  local clearsBefore = _clearInspectCount
+  lu.assertTrue(FirePendingAfterCallbackAt(1), "precondition: a stale timer was pending")
+  lu.assertEquals(_clearInspectCount, clearsBefore,
+    "stale timeout must not ClearInspectPlayer the newer inspect of the same guid (L5)")
+  lu.assertEquals(LIF.GetDebugInfo().currentlyInspecting, guid,
+    "stale timeout must leave the fresh inspect of G intact")
+end
+
 function TestScanReconciliation:test_no_ticker_restart_without_new_member()
   -- GROUP_ROSTER_UPDATE fires far more often than real roster changes (e.g. per-item
   -- loot/skin eligibility syncs). Once the ticker has stopped, a roster-update call
@@ -686,6 +1092,66 @@ function TestScanReconciliation:test_no_ticker_restart_without_new_member()
     "no-op roster update must not create a new ticker")
   lu.assertFalse(LIF.GetDebugInfo().tickerRunning,
     "ticker must stay stopped when nothing actually changed")
+end
+
+function TestScanReconciliation:test_roster_update_arms_ticker_for_pending_member()
+  -- After a disable/re-enable (ticker stopped, cache retains members) or any
+  -- path that leaves a member PENDING with the ticker stopped, a roster update
+  -- must (re)arm the scan ticker so the member still gets scanned — even though
+  -- no NEW member was added. Regression guard for L6.
+  local guid = setupParty1("Player-0-P1")
+  _mockGearLinks["party1"] = {}
+  for slotID = 1, 16 do
+    local link = "item:" .. (14000 + slotID)
+    _mockGearLinks["party1"][slotID] = link
+    _mockIlvl[link] = 415
+  end
+  _mockSpecID["party1"] = 256
+
+  callRosterUpdate()
+  local ticker = LastMockTicker()
+  LIF.OnInspectReady(guid)
+  ticker:Fire()  -- member COMPLETE → ticker stops itself
+  lu.assertFalse(LIF.GetDebugInfo().tickerRunning, "precondition: ticker stopped after member COMPLETE")
+
+  -- Member returns to PENDING (e.g. a loot-time reinspect) but nothing arms the
+  -- ticker — RequestReinspect only drives a single immediate inspect.
+  LIF.RequestReinspect(guid)
+  lu.assertFalse(LIF.GetDebugInfo().tickerRunning, "precondition: RequestReinspect must not arm the ticker")
+
+  callRosterUpdate()  -- same roster, no new member, but a PENDING member exists
+
+  lu.assertTrue(LIF.GetDebugInfo().tickerRunning,
+    "roster update must arm the ticker when a member is PENDING")
+end
+
+function TestScanReconciliation:test_stop_and_reset_releases_inspect_slot()
+  -- Tearing down the queue while an inspect is in flight must release the
+  -- shared client-wide inspect slot, not leave it held for other addons (L7).
+  setupParty1("Player-0-P1")
+  _mockSpecID["party1"] = 256
+  callRosterUpdate()
+  lu.assertNotNil(LIF.GetDebugInfo().currentlyInspecting, "precondition: an inspect is in flight")
+
+  local before = _clearInspectCount
+  LIF.Queue_StopAndReset()
+  lu.assertTrue(_clearInspectCount > before,
+    "Queue_StopAndReset must ClearInspectPlayer to release the shared inspect slot")
+end
+
+function TestScanReconciliation:test_departing_inflight_member_releases_slot()
+  -- When the member we are currently inspecting leaves the group, their inspect
+  -- is abandoned — release the shared slot rather than hold it (L7).
+  local guid = setupParty1("Player-0-P1")
+  _mockSpecID["party1"] = 256
+  callRosterUpdate()
+  lu.assertEquals(LIF.GetDebugInfo().currentlyInspecting, guid, "precondition: party1 in flight")
+
+  _mockGuids["party1"] = nil  -- party1 leaves the group
+  local before = _clearInspectCount
+  callRosterUpdate()
+  lu.assertTrue(_clearInspectCount > before,
+    "a departing in-flight member must release the shared inspect slot")
 end
 
 function TestScanReconciliation:test_resurrect_triggers_immediate_retry()

@@ -1,29 +1,25 @@
 {
   "runtime": {
-    "version": "Lua 5.1"
+    "version": "Lua 5.1",
+    "builtin": {
+      "basic": "disable",
+      "debug": "disable",
+      "io": "disable",
+      "math": "disable",
+      "os": "disable",
+      "package": "disable",
+      "string": "disable",
+      "table": "disable",
+      "utf8": "disable"
+    }
   },
   "workspace": {
     "ignoreDir": ["libs", "tests"]
   },
   "diagnostics": {
-    "globals": [
-      "NotifyInspect", "CanInspect", "CheckInteractDistance",
-      "ClearInspectPlayer", "GetInspectSpecialization",
-      "GetInventoryItemLink", "GetInventorySlotInfo", "GetDetailedItemLevelInfo",
-      "GetItemInfo", "UnitClass", "UnitIsPlayer", "UnitExists", "UnitGUID", "UnitName", "UnitFullName",
-      "UnitIsConnected", "UnitIsDeadOrGhost", "IsInRaid", "IsInGroup",
-      "IsInInstance", "InCombatLockdown", "GetSpecializationInfoByID",
-      "LE_ITEM_BIND_ON_PICKUP", "C_Timer", "C_AddOns", "C_Item", "C_Container", "DEFAULT_CHAT_FRAME",
-      "date", "time", "CreateFrame", "UIParent", "GetTime",
-      "INSPECT_READY", "GROUP_ROSTER_UPDATE", "RAID_ROSTER_UPDATE",
-      "PLAYER_LOOT_ITEM", "PLAYER_ENTERING_WORLD", "PLAYER_REGEN_ENABLED",
-      "ItemLocation", "SlashCmdList", "LibStub", "C_LootHistory",
-      "UnitLevel", "GetSpecialization", "GetSpecializationInfo", "GetNumGroupMembers",
-      "BIND_TRADE_TIME_REMAINING", "C_Heirloom", "C_PaperDollInfo", "GetItemStats", "Item",
-      "SOUNDKIT", "RAID_CLASS_COLORS", "GameFontNormal", "GameFontHighlightSmall", "GameTooltip",
-      "PlaySound", "ClickTradeButton", "ClearCursor", "InitiateTrade", "ChatEdit_InsertLink",
-      "SendChatMessage", "C_ChatInfo", "hooksecurefunc", "IsShiftKeyDown", "Settings", "EditBox_ClearFocus",
-      "MinimalSliderWithSteppersMixin", "CreateMinimalSliderFormatter"
-    ]
+    "globals": ["BIND_TRADE_TIME_REMAINING"]
+  },
+  "type": {
+    "weakUnionCheck": true
   }
 }

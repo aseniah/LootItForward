@@ -9,6 +9,12 @@ local function PlayerLabel(unit)
 end
 
 local currentlyInspecting = nil
+-- Monotonic per-inspect id. Each StartInspect bumps it and its SCAN_TIMEOUT
+-- closure captures the value; the timeout only acts if it's still the current
+-- generation. Guards against a stale timer from an abandoned attempt firing
+-- against a newer in-flight inspect of the SAME guid — e.g. a member who dies
+-- and is battle-rezzed (and re-inspected) inside the 2s window (L5).
+local inspectGeneration = 0
 local scanQueue = {}
 local scanTicker = nil
 
@@ -45,6 +51,18 @@ local SCAN_TIMEOUT    = 2
 -- SCAN_TIMEOUT loop rather than spamming NotifyInspect's own throttle.
 local REASSERT_DELAY  = 0.5
 local MAX_REASSERTS   = 2
+
+-- MIN_HARVEST_SPACING (M7): minimum seconds between two INSPECT_READY fires that
+-- are allowed to advance the D-15 stabilization counter. D-15's "3 consecutive
+-- identical slot counts" was designed around LIF's own ~2s serialized retry
+-- cadence, but harvested foreign reads feed the same counters and are UNPACED —
+-- a mouseover-inspect addon can land 3 fires for one guid in well under a second,
+-- and partial slot data won't have grown between fires that close, so 3 identical
+-- PARTIAL counts would prematurely COMPLETE a member with missing slots. Requiring
+-- a spacing floor between COUNTED fires makes stabilization reflect real settling
+-- time rather than a burst. Not a user-facing setting. Only gates the
+-- below-MIN_SLOTS path; a full (>= MIN_SLOTS) read still accepts immediately.
+local MIN_HARVEST_SPACING = 0.75
 
 local fastTicksLeft   = 0
 local slowTickCounter = 0
@@ -95,6 +113,9 @@ local function CanScanUnit(unit)
   if not CanInspect(unit) then return false end
   return true
 end
+-- Exported so the loot pipeline can decide, at loot time, whether a candidate
+-- can be freshly inspected right now or must fall back to its cached snapshot.
+LIF.CanScanUnit = CanScanUnit
 
 local function HasPendingMembers()
   for _, member in pairs(LIF.Cache.GetAll()) do
@@ -112,8 +133,35 @@ local function StopScanTicker()
   slowTickCounter = 0
 end
 
+-- Clear a departed member's guid from every pending-loot scan window: drop it from
+-- the outstanding-scan set and any confirmed candidacy, then re-check whether the
+-- entry can now open (the leaver may have been the last scan we were waiting on).
+-- Shared by the roster-diff removal and the two queue departure paths (a nil
+-- guid→unit at INSPECT_READY or queue-pop time), so a member who leaves right
+-- before our GROUP_ROSTER_UPDATE fires can't stay stuck in scanningGuids and stall
+-- the popup until the window expires (WR-03 / M11 / AUD-303).
+local function PruneDepartedFromPendingLoot(guid)
+  for _, entry in ipairs(LIF.pendingLootItems or {}) do
+    if entry.scanningGuids then entry.scanningGuids[guid] = nil end
+    if entry.confirmedCandidates then entry.confirmedCandidates[guid] = nil end
+    if LIF.Loot_TryOpenPopup then LIF.Loot_TryOpenPopup(entry) end
+  end
+end
+
 -- Forward declaration so TryQueuePendingMembers can call StartNextInspect.
 local StartNextInspect
+
+-- Append guid to the back of the scan queue unless it is already present. The queue
+-- must never hold two copies of one guid (AUD-007/REV-016): duplicates waste the
+-- NotifyInspect throttle and, if a member leaves and rejoins before a stale entry
+-- drains, silently accumulate. Shared by all three back-insert sites (AUD-403). The
+-- loot-time reinspect front-insert (RequestReinspect) is a distinct move-to-front.
+local function EnqueueUnique(guid)
+  for _, qguid in ipairs(scanQueue) do
+    if qguid == guid then return end
+  end
+  table.insert(scanQueue, guid)
+end
 
 local function TryQueuePendingMembers()
   for guid, member in pairs(LIF.Cache.GetAll()) do
@@ -121,17 +169,7 @@ local function TryQueuePendingMembers()
       local unit = GuidToUnit(guid)
       -- Never queue the player's own unit (Pitfall 9).
       if unit and unit ~= "player" and CanScanUnit(unit) then
-        -- Skip if already queued.
-        local alreadyQueued = false
-        for _, qguid in ipairs(scanQueue) do
-          if qguid == guid then
-            alreadyQueued = true
-            break
-          end
-        end
-        if not alreadyQueued then
-          table.insert(scanQueue, guid)
-        end
+        EnqueueUnique(guid)
       end
     end
   end
@@ -183,9 +221,15 @@ hooksecurefunc("NotifyInspect", function(unit)
 
   currentReassertCount = currentReassertCount + 1
   local guidAtReassert = currentlyInspecting
+  local genAtReassert = inspectGeneration
   LIF.Log("clobber detected guid=" .. guidAtReassert:sub(-6) .. " — reasserting in " .. REASSERT_DELAY .. "s")
   C_Timer.After(REASSERT_DELAY, function()
-    if currentlyInspecting == guidAtReassert then
+    -- Generation guard (AUD-006, same class as L5's SCAN_TIMEOUT guard): a stale
+    -- reassert for an ABANDONED attempt must not re-issue NotifyInspect against a
+    -- NEWER in-flight inspect of the same guid (die → battle-rez → new StartInspect
+    -- within REASSERT_DELAY, where currentlyInspecting == guidAtReassert holds for
+    -- both attempts). The generation distinguishes them.
+    if currentlyInspecting == guidAtReassert and genAtReassert == inspectGeneration then
       local ownUnit = GuidToUnit(guidAtReassert)
       if ownUnit then
         LIF.Log("reasserting " .. PlayerLabel(ownUnit))
@@ -210,6 +254,7 @@ StartNextInspect = function()
   local unit = GuidToUnit(guid)
   if not unit then
     LIF.Cache.Remove(guid)
+    PruneDepartedFromPendingLoot(guid)
     StartNextInspect()
     return
   end
@@ -220,18 +265,25 @@ StartNextInspect = function()
   end
 
   currentlyInspecting = guid
+  inspectGeneration = inspectGeneration + 1
   currentReassertCount = 0
   LIF.Log("inspecting " .. PlayerLabel(unit))
   NotifyInspect(unit)
 
-  -- Capture GUID as a local so the closure is not affected by later changes
-  -- to currentlyInspecting (Pitfall 6).
+  -- Capture GUID and generation as locals so the closure is not affected by later
+  -- changes to currentlyInspecting (Pitfall 6). The generation check ensures a
+  -- stale timer from an ABANDONED attempt can't clobber a newer in-flight inspect
+  -- of the same guid — the guid alone can't distinguish the two (L5).
   local inspectingGuid = guid
+  local inspectGen = inspectGeneration
   C_Timer.After(SCAN_TIMEOUT, function()
-    if currentlyInspecting == inspectingGuid then
+    if currentlyInspecting == inspectingGuid and inspectGen == inspectGeneration then
       currentlyInspecting = nil
       ClearInspectPlayer()  -- release the inspect slot for other addons
-      table.insert(scanQueue, inspectingGuid)
+      -- Dedup before requeue (AUD-007): a loot-time RequestReinspect can front-
+      -- insert this guid while the attempt is still in flight (the L8 no-interrupt
+      -- path), so it may already be queued. EnqueueUnique matches the other sites.
+      EnqueueUnique(inspectingGuid)
       StartNextInspect()
     end
   end)
@@ -246,6 +298,10 @@ function LIF.GetDebugInfo()
 end
 
 function LIF.Queue_StopAndReset()
+  -- Release the shared client-wide inspect slot if we were holding it — there is
+  -- no replacement inspect after a teardown, so without this the slot stays
+  -- held for other addons (L7).
+  if currentlyInspecting then ClearInspectPlayer() end
   currentlyInspecting = nil
   currentReassertCount = 0
   -- Clear in-place so that LIF.scanQueue reference stays live.
@@ -275,15 +331,22 @@ function LIF.OnGroupRosterUpdate()
   -- Remove departed members from cache.
   for guid in pairs(LIF.Cache.GetAll()) do
     if not currentGuids[guid] then
-      if currentlyInspecting == guid then currentlyInspecting = nil end
+      if currentlyInspecting == guid then
+        -- We were inspecting the member who just left; abandon and release the
+        -- shared slot (the end-of-function StartNextInspect may find no
+        -- replacement, so don't rely on it to reclaim the slot) (L7).
+        ClearInspectPlayer()
+        currentlyInspecting = nil
+      end
       local unit = GuidToUnit(guid)
       LIF.Log("remove " .. (unit and PlayerLabel(unit) or guid:sub(-6)))
       LIF.Cache.Remove(guid)
       -- Clear departed member from any pending loot scan windows so _tryOpenPopup
-      -- is not blocked waiting for a member who will never complete (WR-03).
-      for _, entry in ipairs(LIF.pendingLootItems or {}) do
-        if entry.scanningGuids then entry.scanningGuids[guid] = nil end
-      end
+      -- is not blocked waiting for a member who will never complete (WR-03), and
+      -- drop any already-confirmed candidacy so a not-yet-open popup doesn't render
+      -- a row for a member who left (M11). Popup_OnRosterUpdate handles the case
+      -- where the popup is already open.
+      PruneDepartedFromPendingLoot(guid)
     end
   end
 
@@ -294,22 +357,24 @@ function LIF.OnGroupRosterUpdate()
       local unit = currentGuids[guid]
       LIF.Log("queue " .. PlayerLabel(unit))
       LIF.Cache.Add(guid)
-      table.insert(scanQueue, guid)
+      -- Dedup against any stale entry left by a leave→rejoin before it drained
+      -- (AUD-403): departure removes the member from the cache but not the queue.
+      EnqueueUnique(guid)
       addedNewMember = true
     end
   end
 
   TryQueuePendingMembers()
-  -- Only (re)start the ticker for an actual new member (or initial formation) —
-  -- GROUP_ROSTER_UPDATE fires far more often than real roster changes (Blizzard
-  -- syncs personal-loot eligibility per item/skin through the same event), and
-  -- restarting the ticker on every one of those churns through short-lived
-  -- C_Timer tickers for no reason. The loot pipeline (LIF.EnsureScanTickerRunning
-  -- in OnPlayerLootReceived) and the reconnect/resurrect recovery path
-  -- (OnUnitMaybeScannable) already arm the ticker whenever a member actually
-  -- needs (re)scanning, independent of this event.
-  if addedNewMember then
-    EnsureScanTickerRunning(true)
+  -- Arm the ticker whenever a member still needs scanning. A new member (or
+  -- initial formation) re-enters the fast phase; an already-PENDING member with
+  -- the ticker stopped (e.g. after a disable/re-enable that kept the cache, or a
+  -- loot-time reinspect) arms it at the normal cadence. EnsureScanTickerRunning
+  -- no-ops when the ticker is already running, so this does NOT churn on the
+  -- frequent no-membership-change fires (those leave everyone COMPLETE →
+  -- HasPendingMembers() is false → nothing arms). Passing fast only for a new
+  -- member avoids repeatedly re-entering the fast phase on those fires.
+  if addedNewMember or HasPendingMembers() then
+    EnsureScanTickerRunning(addedNewMember)
   end
   StartNextInspect()
 end
@@ -332,7 +397,9 @@ function LIF.OnInspectReady(guid)
   local unit = GuidToUnit(guid)
   if not unit then
     LIF.Cache.Remove(guid)
+    PruneDepartedFromPendingLoot(guid)
     if isOwnTarget then
+      ClearInspectPlayer()  -- release the inspect slot (AUD-008), matching teardown
       currentlyInspecting = nil
       StartNextInspect()
     end
@@ -347,8 +414,14 @@ function LIF.OnInspectReady(guid)
       -- level), so scaling items report the ilvl at the MEMBER's level, not the local player's.
       -- GetDetailedItemLevelInfo applies the local player's context and will over-report ilvl
       -- for scaling items worn by lower-level party members.
-      local actualIlvl = select(4, GetItemInfo(link)) or C_Item.GetDetailedItemLevelInfo(link)
-      gearData[slotID] = { link = link, ilvl = actualIlvl }
+      -- equipLoc is captured from the SAME call and cached per slot so eval-time
+      -- weapon-config checks (is2HEquipped, D-16 off-hand) never re-call
+      -- GetItemInfo live at loot time — which returns nil for an item that has
+      -- since aged out of the local cache, misreading a 2H as not-2H (M1). It
+      -- may still be nil here on a cold cache; consumers fail closed on nil.
+      local _, _, _, itemIlvl, _, _, _, _, equipLoc = GetItemInfo(link)
+      local actualIlvl = itemIlvl or C_Item.GetDetailedItemLevelInfo(link)
+      gearData[slotID] = { link = link, ilvl = actualIlvl, equipLoc = equipLoc }
     end
   end
 
@@ -369,15 +442,30 @@ function LIF.OnInspectReady(guid)
   -- who genuinely equip fewer than MIN_SLOTS items. Harvested (foreign) reads feed
   -- the same counters, so another addon's inspect traffic can help this converge
   -- faster, not just our own serialized attempts.
+  --
+  -- A CHANGED count always resets (slot data grew/shrank — meaningful). An
+  -- unchanged count advances the counter only if it's a full read (>= MIN_SLOTS,
+  -- where the counter is moot because it accepts immediately) or the fire is at
+  -- least MIN_HARVEST_SPACING after the last COUNTED fire (M7). An unchanged
+  -- partial count arriving in a foreign burst (too soon) is ignored for
+  -- stabilization — it neither advances nor resets — so a rapid mouseover sweep
+  -- can't fast-track a partial read to COMPLETE with missing slots.
   if member then
-    if slotCount == member.lastSlotCount then
-      member.consistentCount = (member.consistentCount or 0) + 1
-    else
+    local now = GetTime()
+    if slotCount ~= member.lastSlotCount then
       member.lastSlotCount = slotCount
       member.consistentCount = 1
+      member.lastCountedTime = now
+    elseif slotCount >= MIN_SLOTS
+        or (now - (member.lastCountedTime or 0)) >= MIN_HARVEST_SPACING then
+      member.consistentCount = (member.consistentCount or 0) + 1
+      member.lastCountedTime = now
     end
   end
 
+  -- A wholly zero-slot read stabilizes like any other count — there is deliberately no
+  -- >0 floor (M8, reviewed across audits and left as-is; see .development audit findings
+  -- before re-flagging). The realistic zero-read trigger recovers via the reinspect queue.
   local stabilized = member and (member.consistentCount or 0) >= 3
   if slotCount < MIN_SLOTS and not stabilized then
     LIF.Log("warn: " .. label .. " gear=" .. slotCount .. "/16" .. combatTag .. " — awaiting data")
@@ -390,7 +478,11 @@ function LIF.OnInspectReady(guid)
   -- Resolve spec name and class for inspect record and loot evaluation.
   local _, classToken = UnitClass(unit)
   local _, specName = GetSpecializationInfoByID(specID or 0)
-  local specTag = specID and (specID .. "(" .. (specName or "?") .. ")") or "nil"
+  -- Normalize a lost/unknown spec's nil name to "?" so it OVERWRITES a stale prior
+  -- specName instead of being dropped from SetComplete's merge (AUD-313 — the
+  -- specName sibling of the AUD-013 specID normalization below).
+  specName = specName or "?"
+  local specTag = specID and (specID .. "(" .. specName .. ")") or "nil"
 
   -- Capture full name+realm for armory lookups. Same-realm members return ""
   -- for realm from UnitFullName, so fall back to the player's own realm.
@@ -416,13 +508,18 @@ function LIF.OnInspectReady(guid)
   if member then
     member.lastSlotCount = nil
     member.consistentCount = nil
+    member.lastCountedTime = nil
   end
 
   local playerLevel = UnitLevel(unit) or "?"
   local inspectIlvl = C_PaperDollInfo.GetInspectItemLevel(unit)
   local ilvlTag = (inspectIlvl and inspectIlvl > 0) and math.floor(inspectIlvl) or "?"
 
-  LIF.Cache.SetComplete(guid, { gear = gearData, specID = specID, specName = specName, lvl = playerLevel, ilvl = ilvlTag })
+  -- Normalize specID to 0 so a member with no selected spec (nil/0 from
+  -- GetInspectSpecialization) is stored as 0 and evaluated as "unknown spec →
+  -- ignored", never leaving a stale prior specID behind via SetComplete's merge
+  -- (AUD-013). A nil here would omit the key and resurrect the old spec.
+  LIF.Cache.SetComplete(guid, { gear = gearData, specID = specID or 0, specName = specName, lvl = playerLevel, ilvl = ilvlTag })
   LIF.Log("complete " .. label .. " class=" .. tostring(classToken) ..
     " spec=" .. specTag .. " gear=" .. slotCount .. "/16" ..
     " lvl=" .. playerLevel .. " ilvl=" .. ilvlTag .. combatTag .. (isOwnTarget and "" or " [harvested]"))
@@ -451,6 +548,7 @@ function LIF.OnUnitHealthChanged(unitToken)
   local guid = UnitGUID(unitToken)
   if guid == nil then return end
   if guid == currentlyInspecting and UnitIsDeadOrGhost(unitToken) then
+    ClearInspectPlayer()  -- release the inspect slot (AUD-008), matching teardown
     currentlyInspecting = nil
     StartNextInspect()
   end
@@ -461,6 +559,7 @@ function LIF.OnUnitDisconnect(unitToken)
   local guid = UnitGUID(unitToken)
   if guid == nil then return end
   if guid == currentlyInspecting then
+    ClearInspectPlayer()  -- release the inspect slot (AUD-008), matching teardown
     currentlyInspecting = nil
     StartNextInspect()
   end
@@ -490,21 +589,25 @@ function LIF.EnsureScanTickerRunning(fast)
   EnsureScanTickerRunning(fast)
 end
 
--- LIF.RequestReinspect(guid)  (D-14)
--- Forces a fresh loot-time inspect for a specific party member.
--- Preserves cached class/spec data; resets gear data; moves member to PENDING;
--- inserts the GUID at the FRONT of the scan queue.
+-- LIF.RequestReinspect(guid)  (D-14, revised for cache-fallback)
+-- Forces a fresh loot-time inspect for a specific party member: moves them to
+-- PENDING and front-queues the GUID. RETAINS the last COMPLETE gear as a
+-- fallback snapshot — if this fresh inspect can't finish (member dead/offline,
+-- or the scanning window expires), the loot pipeline evaluates against the
+-- retained gear rather than dropping the member. SetComplete overwrites
+-- member.gear wholesale when the fresh scan lands, and OnLootInspectReady's
+-- COMPLETE gate ignores the stale gear until then, so keeping it is safe.
 function LIF.RequestReinspect(guid)
   local member = LIF.Cache.GetMember(guid)
   if not member then return end  -- member left group
 
-  -- Preserve specID and class info; reset gear data only.
-  member.gear  = {}
+  -- Retain member.gear as the fallback snapshot; only flip state to PENDING.
   member.state = "PENDING"
 
   -- Reset stabilization counters so next set of INSPECT_READY fires counts fresh.
   member.lastSlotCount  = nil
   member.consistentCount = nil
+  member.lastCountedTime = nil
 
   -- REV-016: rapid multi-drop loot calls RequestReinspect repeatedly for the
   -- same members — remove any existing entry so the guid is moved to the
@@ -521,6 +624,14 @@ function LIF.RequestReinspect(guid)
   LIF.Log("reinspect queued guid=" .. guid:sub(-6))
 
   -- If nothing is currently scanning, kick off the next inspect immediately.
+  -- If we're ALREADY inspecting this same guid, we deliberately do NOT interrupt
+  -- and restart it (L8): the in-flight request will deliver an INSPECT_READY that
+  -- satisfies this reinspect. That response can be up to SCAN_TIMEOUT (2s) older
+  -- than "now", so the D-14 "fresh loot-time scan" guarantee is really "at most
+  -- SCAN_TIMEOUT stale" in this narrow overlap. Accepted: gear rarely changes in a
+  -- 2s window, cancelling an in-flight inspect to restart it wastes the shared
+  -- inspect slot + NotifyInspect throttle, and combat-gating makes the overlap
+  -- rare anyway (inspects are suppressed in combat and loot lands right after).
   if currentlyInspecting == nil then
     StartNextInspect()
   end

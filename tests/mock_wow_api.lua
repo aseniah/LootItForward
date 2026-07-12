@@ -1,6 +1,6 @@
 -- tests/mock_wow_api.lua
 -- Standalone WoW API stubs for offline luaunit testing.
--- All globals required by core/cache.lua and core/queue.lua are stubbed here.
+-- All globals required by the harness-loaded core modules (see LoadAddonModules) are stubbed here.
 -- Call ResetMocks() in each test setUp to prevent state leakage.
 
 -- ============================================================
@@ -51,6 +51,18 @@ function FirePendingAfterCallbacks()
   for _, cb in ipairs(cbs) do
     cb.fn()
   end
+end
+
+-- Helper: fire a single pending After callback by 1-based insertion index and
+-- remove it, leaving the rest pending. Use to fire ONE specific timer (e.g. a
+-- stale SCAN_TIMEOUT scheduled before a newer one of the same delay) in isolation.
+-- Returns true if a callback existed at that index.
+function FirePendingAfterCallbackAt(index)
+  local cb = pendingAfterCallbacks[index]
+  if not cb then return false end
+  table.remove(pendingAfterCallbacks, index)
+  cb.fn()
+  return true
 end
 
 -- Helper: fire only callbacks scheduled with delay <= maxDelay, leaving
@@ -408,6 +420,14 @@ function time()
   return 0
 end
 
+-- GetTime(): WoW returns the client uptime in seconds (float, ms precision).
+-- Tests drive it by assigning _mockTime to simulate the passage of time between
+-- INSPECT_READY fires (M7 stabilization pacing).
+_mockTime = 0
+function GetTime()
+  return _mockTime
+end
+
 -- ============================================================
 -- GetItemInfo stub (Phase 3)
 -- Returns 14 positional fields matching the WoW retail API order:
@@ -447,14 +467,17 @@ function FirePendingItemLoads()
 end
 
 -- ============================================================
--- GetItemStats stub (Phase 3)
+-- C_Item.GetItemStats stub (Phase 3)
 -- Returns a table of stat keys → values, or {} if not set.
 -- Tests control ITEM_MOD_AGILITY_SHORT / ITEM_MOD_STRENGTH_SHORT /
 -- ITEM_MOD_INTELLECT_SHORT to simulate primary-stat presence.
+--
+-- Lives on C_Item, not as a bare global: the global GetItemStats no longer exists in
+-- retail, so stubbing it there would exercise a branch production can never take.
 -- ============================================================
 _mockItemStats = {}
 
-function GetItemStats(link)
+C_Item.GetItemStats = function(link)
   return _mockItemStats[link] or {}
 end
 
@@ -524,6 +547,9 @@ function ResetMocks()
   -- Global booleans
   _mockInCombat = false
   _mockInRaid   = false
+
+  -- Simulated clock (GetTime) — M7 stabilization pacing
+  _mockTime = 0
 
   -- CanInspect / visibility
   _mockCanInspect = {}

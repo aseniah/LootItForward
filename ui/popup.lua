@@ -27,8 +27,10 @@ local ROW_H            = 48
 local SECTION_GAP      = 6
 local SECTION_INSET    = 6    -- keeps sections inside the 1px edgeFile border
 
--- Forward declaration — _removeSection is defined after the layout helpers.
+-- Forward declarations — these are defined after the layout helpers but are
+-- referenced earlier (e.g. by the TRADE_CLOSED handler's completion cascade).
 local _removeSection
+local _recalcFrameHeight
 
 -- pendingTrade: set by [Trade] button OnClick; consumed by TRADE_SHOW handler.
 -- Shape: { itemLink = string, unit = string, t = GetTime() } or nil.
@@ -55,17 +57,56 @@ local tradedItemLink = nil
 -- the TRADE_CLOSED handler can include it in the info log.
 local tradeRecipient = nil
 
+-- tradedItemCount: copy count of the item's itemID captured at TRADE_SHOW (before we
+-- pick one up). For a timered item (BoP): the tradeable-copy count, consulted for the
+-- D-03 stacked-drop case (>= 2) where presence can't tell a completed trade from a
+-- cancel when a second tradeable copy remains (AUD-310). For an untimed item (BoE):
+-- the plain copy count, whose decrease is the ONLY completion signal (AUD-402).
+local tradedItemCount = nil
+
+-- tradedItemTimered: whether the copy we picked up at TRADE_SHOW had an active trade
+-- timer. A BoE/BoU passes IsItemTradeable with no timer, so FindTradeableSlot can't
+-- see it and presence-by-timer would read "completed" vacuously on a cancel — the
+-- untimed case must detect completion by a plain count decrease instead (AUD-402).
+local tradedItemTimered = nil
+
 -- examplePopupActive: set true by ShowExamplePopup before calling ShowPopup;
--- cleared by the popup frame's OnHide script. Whisper and Trade buttons
--- check this flag and early-return in example mode (D-19).
+-- cleared by dismissPopup (the teardown path) — NOT an OnHide script, which would
+-- also fire on a parent-driven hide and desync the flag (AUD-302). Whisper and Trade
+-- buttons check this flag and early-return in example mode (D-19).
 LIF.examplePopupActive = false
+
+-- Whisper prefix, prepended to every outgoing whisper (AUD-014). Counts toward the
+-- 255-byte SendChatMessage limit. Exported so ui/settings.lua's length counter and
+-- the send-time backstop below share one source of truth (popup.lua loads first).
+LIF.WHISPER_PREFIX = "[Loot It Forward] "
+LIF.WHISPER_MAX_BYTES = 255
+local WHISPER_MAX_BYTES = LIF.WHISPER_MAX_BYTES
+-- Max characters the settings whisper-template editbox accepts. Exported so the
+-- settings hint, SetMaxLetters, and length counter share one source of truth (AUD-318).
+LIF.WHISPER_MAX_TEMPLATE_CHARS = 100
+-- Default whisper template. Single source of truth (AUD-408): the AceDB `defaults`
+-- table in LootItForward.lua (which loads after popup.lua per TOC) and the send-time
+-- fallback both reference this, rather than repeating the literal.
+LIF.DEFAULT_WHISPER_TEMPLATE = "Hey, {link} dropped for me and I don't need it. Do you want it?"
 
 -- ============================================================
 -- Dismiss (module-local so the Dismiss button OnClick can reference it)
 -- ============================================================
 
 local function dismissPopup()
-  if not frame then return end
+  -- Nothing to dismiss (frame never created, or already hidden with no sections):
+  -- return before logging so the location-change dismiss on every PLAYER_ENTERING_WORLD
+  -- doesn't spam "popup: dismissed" with nothing showing (AUD-309). A parent-driven
+  -- hide (Alt+Z) leaves the frame's own IsShown true, so this never swallows a real
+  -- dismiss.
+  if not frame or (not frame:IsShown() and not next(itemSections)) then return end
+  -- If an event-driven dismiss (roster prune, TRADE_CLOSED cascade, PEW location
+  -- change) lands mid-drag, OnMouseUp never fires on the hidden frame, so the frame
+  -- would stay in the moving state and stick to the cursor on the next Show. Stop the
+  -- move here (harmless when not moving). Deliberately do NOT save the dragged
+  -- position — a dismiss is not a deliberate placement (AUD-307).
+  frame:StopMovingOrSizing()
   -- Tear down all section frames
   for itemLink, _ in pairs(itemSections) do
     _removeSection(itemLink)
@@ -73,9 +114,36 @@ local function dismissPopup()
   itemSections = {}
   pendingTrade = nil
   tradedItemLink = nil
+  tradeRecipient = nil
+  tradedItemCount = nil
+  tradedItemTimered = nil
+  -- Clear the example-mode flag here, in the actual teardown, rather than in an
+  -- OnHide script: WoW fires OnHide on any effective visibility change, including a
+  -- parent-driven hide (UIParent hidden by Alt+Z / a cinematic), which would desync
+  -- the flag to false while the example content is still logically up (AUD-302).
+  LIF.examplePopupActive = false
   frame:SetHeight(FRAME_MIN_HEIGHT)
   frame:Hide()
   LIF.Log("popup: dismissed")
+end
+
+-- Combat start clears any open example/preview popup (M5): real loot usually lands
+-- via ENCOUNTER_LOOT_RECEIVED after combat begins, so eagerly clearing the example
+-- here avoids the interleave in the common case. This is NOT the only backstop —
+-- a real drop can call ShowPopup in the post-combat scanning window with an example
+-- still up, so ShowPopup itself also evicts a live example (AUD-002). dismissPopup
+-- clears examplePopupActive as part of teardown.
+function LIF.Popup_DismissExample()
+  if LIF.examplePopupActive then
+    dismissPopup()
+  end
+end
+
+-- Public dismiss for whichever popup is up (real OR example — they share one
+-- frame). Used by PLAYER_ENTERING_WORLD to close the popup on a location change
+-- (AUD-021). No-op when nothing is showing.
+function LIF.Popup_Dismiss()
+  dismissPopup()
 end
 
 local function _saveDraggedPosition()
@@ -116,15 +184,33 @@ tradeEventFrame:SetScript("OnEvent", function(self, event)
     local targetUnit = pendingTrade.unit
     pendingTrade = nil   -- clear before any early returns to avoid stale state
 
+    -- Verify the trade partner is who we opened the trade with (AUD-003). The TTL
+    -- above only rejects LATE trades; within it, a DIFFERENT player opening a trade
+    -- with us (common post-boss, when loot is passed around) would otherwise get our
+    -- item auto-placed into their trade. During an open trade the "npc" unit token is
+    -- the partner. Block only on a POSITIVE mismatch: if the token is unresolvable we
+    -- fall through to the prior behaviour (no regression). UnitIsUnit is used only in
+    -- the condition, never string-embedded (cf. secret-boolean pitfall).
+    if targetUnit and UnitExists("npc") and not UnitIsUnit("npc", targetUnit) then
+      LIF.Log("popup: TRADE_SHOW partner mismatch (trade opened with "
+        .. tostring(UnitName("npc")) .. ", expected " .. tostring(UnitName(targetUnit))
+        .. ") — not auto-populating")
+      return
+    end
+
     -- Match by itemID, not full hyperlink — loot events use |cnIQ3: notation while
     -- C_Container.GetContainerItemInfo().hyperlink uses |cffXXXXXX hex notation.
     -- FindTradeableSlot ensures we pick up the fresh (tradeable) copy, not an
     -- existing owned copy of the same item that has no trade timer.
     local targetItemID = tonumber(targetLink:match("item:(%d+)"))
     local foundBag, foundSlot = LIF.FindTradeableSlot(targetItemID)
+    -- Whether the picked-up copy carries a trade timer. A BoE/BoU is tradeable with
+    -- NO timer, so FindTradeableSlot misses it and we fall back to a plain bag search;
+    -- TRADE_CLOSED must then detect completion by count, not timer presence (AUD-402).
+    local timered = foundBag ~= nil
     if not foundBag then
-      -- Fall back to any copy if the tooltip scan can't discriminate (locale/API issue).
-      -- The item passed IsItemTradeable so it should be the right one.
+      -- Fall back to any copy if the tooltip scan can't discriminate (locale/API issue)
+      -- or the item is an untimed BoE/BoU. It passed IsItemTradeable, so it's the right one.
       foundBag, foundSlot = LIF.FindItemInBags(targetItemID)
     end
 
@@ -133,12 +219,21 @@ tradeEventFrame:SetScript("OnEvent", function(self, event)
       return
     end
 
+    -- Baseline copy count BEFORE picking one up (all copies still in bags), so
+    -- TRADE_CLOSED can detect a decrease: tradeable-copy count for a timered item
+    -- (D-03 duplicate case, AUD-310), plain count for an untimed BoE (AUD-402).
+    tradedItemCount = timered and LIF.CountTradeableSlots(targetItemID)
+                              or LIF.CountItemInBags(targetItemID)
+    tradedItemTimered = timered
     -- Pick up the item and place it in trade slot 1, then clear cursor.
     C_Container.PickupContainerItem(foundBag, foundSlot)
     ClickTradeButton(1)
     ClearCursor()
     tradedItemLink = targetLink   -- save so TRADE_CLOSED can detect success
-    tradeRecipient = targetUnit and UnitName(targetUnit) or "?"
+    -- Name from the actual partner ("npc") when resolvable (authoritative, and now
+    -- verified to match the intended unit above); fall back to the intended unit.
+    tradeRecipient = (UnitExists("npc") and UnitName("npc"))
+      or (targetUnit and UnitName(targetUnit)) or "?"
     LIF.Log("popup: auto-populated trade slot 1 with " .. tostring(targetLink))
     LIF.Log("Trade window opened — offering " .. tostring(targetLink) .. " to " .. tostring(tradeRecipient), "info")
 
@@ -147,8 +242,16 @@ tradeEventFrame:SetScript("OnEvent", function(self, event)
     local link = tradedItemLink
     local itemID = tonumber(link:match("item:(%d+)"))
     local recipient = tradeRecipient
+    local baseline = tradedItemCount   -- copies before we picked one up (AUD-310/AUD-402)
+    local timered = tradedItemTimered
+    -- Bind the section we're acting on by identity, not just its link key (AUD-405):
+    -- a same-link re-drop removes and re-creates the section at the same key, so a
+    -- key-only guard would let a stale retry act on the wrong (newer) section.
+    local sectionRef = itemSections[link]
     tradedItemLink = nil
     tradeRecipient = nil   -- capture-and-clear now so a trade opened during the retry window can't clobber it
+    tradedItemCount = nil
+    tradedItemTimered = nil
 
     -- WoW updates container state after TRADE_CLOSED fires, so an immediate
     -- scan sees the item still present even on a successful trade. Retry up
@@ -157,16 +260,39 @@ tradeEventFrame:SetScript("OnEvent", function(self, event)
     -- Match by trade timer, not bare itemID (FindItemInBags): a pre-owned,
     -- untimed copy of the same item would otherwise read as "still have it"
     -- forever and misreport a completed trade as cancelled.
+    --
+    -- Untimed BoE/BoU (AUD-402): the item has no trade timer, so FindTradeableSlot
+    -- can never see it and presence-by-timer reads "completed" vacuously even on a
+    -- cancel. Detect completion by a plain count DECREASE from the TRADE_SHOW baseline.
+    -- D-03 stacked-drop (AUD-310): with >= 2 tradeable copies of this itemID,
+    -- FindTradeableSlot still finds the second copy after ours is traded, so presence
+    -- can't say "completed" either — same count-decrease signal (tradeable count).
+    -- The common single-timered-copy path keeps the proven presence check untouched.
+    local dupCase = (baseline or 0) >= 2
     local function checkTradeResult(attempt)
       C_Timer.After(TRADE_CLOSED_RETRY_DELAY, function()
-        if not itemSections[link] then return end   -- popup already torn down/repopulated elsewhere
-        local foundBag = LIF.FindTradeableSlot(itemID)
-        local stillHaveIt = foundBag ~= nil
+        if itemSections[link] ~= sectionRef then return end   -- section torn down or replaced by a same-link re-drop (AUD-405)
+        local completed
+        if not timered then
+          completed = LIF.CountItemInBags(itemID) < baseline
+        elseif dupCase then
+          completed = LIF.CountTradeableSlots(itemID) < baseline
+        else
+          completed = LIF.FindTradeableSlot(itemID) == nil
+        end
 
-        if not stillHaveIt then
-          LIF.Log("popup: trade completed — dismissing popup")
+        if completed then
+          LIF.Log("popup: trade completed — removing item section")
           LIF.Log("Traded " .. tostring(link) .. " to " .. tostring(recipient), "info")
-          dismissPopup()
+          -- Remove only the traded item's section (D-03 multi-item): a second
+          -- stacked drop's section must stay actionable. Dismiss the whole popup
+          -- only when nothing else remains.
+          _removeSection(link)
+          if not next(itemSections) then
+            dismissPopup()
+          elseif frame and frame:IsShown() then
+            _recalcFrameHeight()
+          end
         elseif attempt < TRADE_CLOSED_RETRY_MAX then
           checkTradeResult(attempt + 1)
         else
@@ -191,25 +317,66 @@ local function _defaultPopupPosition(frameHeight)
   return x, y
 end
 
+-- A saved position is only usable if BOTH coords are real numbers and y is
+-- positive (TOPLEFT anchors to UIParent BOTTOMLEFT, so y<=0 is off-screen). A
+-- partially-corrupt save such as { y = 400 } with x missing would otherwise
+-- pass a y-only guard and then throw on SetPoint(nil x) / the position concat.
+local function _hasSavedPosition(pos)
+  return pos and type(pos.x) == "number" and type(pos.y) == "number" and pos.y > 0
+end
+
+-- Is a saved (x, y) actually on the CURRENT screen? The anchor is the frame's
+-- TOPLEFT against UIParent's BOTTOMLEFT, so x is the left edge and y is the top
+-- edge's height above the bottom. Require the title bar to stay grabbable: enough
+-- horizontal overlap, and the title strip fully within the vertical extent. A
+-- position saved at a larger resolution (or after a UI-scale change) can land
+-- off-screen; this catches that so the popup is re-centered instead of lost.
+local MIN_ONSCREEN = 40  -- px of the frame that must remain visible
+local function _isOnScreen(x, y)
+  local w = UIParent:GetWidth() or 1024
+  local h = UIParent:GetHeight() or 768
+  local visibleW = math.min(x + FRAME_WIDTH, w) - math.max(x, 0)
+  -- Positive-form comparisons so a NaN coord (which fails every ordered compare)
+  -- is treated as off-screen rather than slipping through a `< / >` negation.
+  if not (visibleW >= MIN_ONSCREEN) then return false end
+  if not (y <= h and y >= TITLE_BAR_HEIGHT) then return false end
+  return true
+end
+
+-- Resolve the position to open at: the saved one if it is valid AND on-screen,
+-- otherwise the centered default. A corrupt or off-screen save is CLEARED so the
+-- popup stays centered on later shows rather than being re-detected every time
+-- (AUD-018 — mirrors what /lif resetpos does, but automatically).
+local function _resolvePopupPosition()
+  local pos = LootItForward and LootItForward.db and LootItForward.db.char.popupPosition
+  if _hasSavedPosition(pos) and _isOnScreen(pos.x, pos.y) then
+    return pos.x, pos.y
+  end
+  if pos and LootItForward and LootItForward.db then
+    LootItForward.db.char.popupPosition = nil
+    LIF.Log(_hasSavedPosition(pos)
+      and "popup: saved position off-screen — re-centering"
+      or "popup: ignoring corrupt saved position — re-centering")
+  end
+  return _defaultPopupPosition()
+end
+
 -- ============================================================
 -- Frame factory
 -- ============================================================
 
 local function createPopupFrame()
-  -- Read saved position; center on screen if none saved yet or corrupted (y <= 0).
-  local pos = LootItForward and LootItForward.db and LootItForward.db.char.popupPosition
-  local x, y
-  if pos and pos.y and pos.y > 0 then
-    x, y = pos.x, pos.y
-  else
-    x, y = _defaultPopupPosition()
-  end
+  -- Read saved position; center on screen if none saved, corrupted, or off-screen.
+  local x, y = _resolvePopupPosition()
 
   local f = CreateFrame("Frame", "LIFPopupFrame", UIParent, "BackdropTemplate")
   f:SetSize(FRAME_WIDTH, FRAME_MIN_HEIGHT)
   f:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", x, y)
   f:SetMovable(true)
   f:EnableMouse(true)
+  -- Keep the frame on screen: blocks dragging the title bar off-edge (which would
+  -- persist an unreachable position) and clamps a restored point back into view.
+  f:SetClampedToScreen(true)
   f:SetToplevel(true)
   f:SetFrameStrata("MEDIUM")
 
@@ -253,11 +420,6 @@ local function createPopupFrame()
   closeBtn:SetScript("OnClick", function() dismissPopup() end)
   f.closeBtn = closeBtn
 
-  -- Clear the example-mode flag when the popup is hidden (D-19 / RESEARCH.md Pitfall 4).
-  f:SetScript("OnHide", function()
-    LIF.examplePopupActive = false
-  end)
-
   -- CRITICAL: CreateFrame starts IsShown=true (Pitfall 1) — must Hide() before returning
   f:Hide()
 
@@ -269,7 +431,7 @@ end
 -- Section and row layout helpers
 -- ============================================================
 
-local function _recalcFrameHeight()
+function _recalcFrameHeight()
   if not frame then return end
 
   -- Collect sections in stable order: we store insertionOrder on each section
@@ -315,6 +477,18 @@ local function _recalcFrameHeight()
 end
 
 -- Remove a section by itemLink: hide and unparent its frame and all rows, clear table entry.
+--
+-- KNOWN SMELL (audit L11, accepted): section and row frames are created fresh per
+-- popup and only Hide()+SetParent(nil) here — WoW never garbage-collects frames,
+-- so they accumulate over a play session. No correctness impact, and the practical
+-- cost is negligible (a few dozen frames per popup; even a marathon session is
+-- low-thousands, which WoW handles trivially). The standard remedy is a frame pool
+-- (acquire on show, hide+return here instead of orphaning), but a correct pool
+-- requires splitting create-children-once from configure-per-use and re-pointing
+-- every child closure (header/hover zones, whisper/trade buttons) off its captured
+-- itemData/candidateData upvalue onto frame-attached fields — a ~300-line rewrite
+-- of this file with no offline test coverage. Deferred to a dedicated UI pass where
+-- it can be verified in-game; not worth the churn/risk for a leak this minor.
 _removeSection = function(itemLink)
   local section = itemSections[itemLink]
   if not section then return end
@@ -340,6 +514,35 @@ end
 
 -- Track insertion order for stable section stacking
 local _sectionCounter = 0
+
+-- The player's authoritative compare slot for the header hover, mirroring the slot
+-- eligibility actually used so the hover shows that piece (or "Nothing equipped")
+-- and not some other, higher-ilvl one:
+--   * rings (11/12) and trinkets (13/14): the LOWER-ilvl of the two equipped slots,
+--     heirloom-adjusted (an active heirloom reads as math.huge so it never wins the
+--     low side) and possibly EMPTY (ilvl 0) — via core's LIF.HeirloomAdjustedIlvl (AUD-308).
+--   * weapons: the weaker hand of a dual-wield pair, the off-hand for an off-hand-only
+--     drop, or the equipped 2H — via core's LIF.PlayerWeaponCompareSlot (AUD-404).
+-- All other categories compare slotIDs[1].
+local function _headerCompareSlot(itemData)
+  local slots = itemData.slotIDs
+  if not slots then return nil end
+  if itemData.slotCategory == "ring" or itemData.slotCategory == "trinket" then
+    local a, b = slots[1], slots[2]
+    if not (a and b) then return a or b end
+    local level = UnitLevel("player")
+    local function adj(slot)
+      local link = GetInventoryItemLink("player", slot)
+      local ilvl = link and (C_Item.GetDetailedItemLevelInfo(link) or 0) or 0
+      return LIF.HeirloomAdjustedIlvl and LIF.HeirloomAdjustedIlvl(link, level, ilvl) or ilvl
+    end
+    return (adj(a) <= adj(b)) and a or b   -- tie -> first, matching core
+  end
+  if itemData.slotCategory == "weapon" and LIF.PlayerWeaponCompareSlot then
+    return LIF.PlayerWeaponCompareSlot(itemData) or slots[1]
+  end
+  return slots[1]
+end
 
 -- _addItemSection(itemData): builds a section sub-frame as a child of the main frame.
 -- Returns the section table (sectionFrame, candidateRows, candidateDataByGuid, itemData, insertionOrder, rowOrder, _rowCounter).
@@ -423,13 +626,16 @@ local function _addItemSection(itemData)
     end
   end)
   headerZone:SetScript("OnEnter", function(self)
+    if not itemData.link then return end  -- ClassifyItem guarantees a link; guard anyway (AUD-308)
     LIFItemTooltip:SetOwner(UIParent, "ANCHOR_NONE")
     LIFItemTooltip:ClearAllPoints()
     LIFItemTooltip:SetPoint("TOPLEFT", frame, "TOPRIGHT", 5, 0)
     LIFItemTooltip:SetHyperlink(itemData.link)
     LIFItemTooltip:Show()
-    local equippedLink = itemData.slotIDs and itemData.slotIDs[1]
-      and GetInventoryItemLink("player", itemData.slotIDs[1])
+    -- Compare against the slot eligibility actually used (lower-of-two for
+    -- rings/trinkets), not always slotIDs[1] (AUD-308).
+    local compareSlot = _headerCompareSlot(itemData)
+    local equippedLink = compareSlot and GetInventoryItemLink("player", compareSlot)
     LIFCompareTooltip:SetOwner(UIParent, "ANCHOR_NONE")
     LIFCompareTooltip:ClearAllPoints()
     LIFCompareTooltip:SetPoint("TOPLEFT", LIFItemTooltip, "TOPRIGHT", 5, 0)
@@ -449,7 +655,7 @@ local function _addItemSection(itemData)
   -- Section table
   local section = {
     sectionFrame         = sec,
-    candidateRows        = {},    -- guid -> Button
+    candidateRows        = {},    -- guid -> Frame
     candidateDataByGuid  = {},    -- guid -> candidateData
     itemData             = itemData,
     insertionOrder       = _sectionCounter,
@@ -460,8 +666,80 @@ local function _addItemSection(itemData)
   return section
 end
 
--- _addCandidateRow(section, candidateData, itemLink): builds a Button row in a section.
--- Returns the row Button.
+-- Renders the full whisper text for a template + item link, including the prefix.
+-- Pure string op — no send. gsub replaces EVERY {link} occurrence, so a multi-{link}
+-- template is measured exactly (AUD-014). Shared by the send path (real link) and the
+-- settings length counter (EXAMPLE_ITEM_LINK) so both measure identical byte lengths.
+function LIF.RenderWhisperMessage(template, link)
+  -- gsub treats % as magic in the REPLACEMENT (%1..%9; a lone %x errors), and a
+  -- localized item name/link is outside our control (the over-length degrade path
+  -- feeds the raw name in by design), so escape % before substituting (AUD-304).
+  -- Assign to a local first: inlining the :gsub would pass its match COUNT as the
+  -- outer gsub's n argument and cap replacements.
+  local replacement = (link or ""):gsub("%%", "%%%%")
+  return LIF.WHISPER_PREFIX .. string.gsub(template or "", "{link}", replacement)
+end
+
+-- Reduce WoW color/hyperlink/texture markup to plain text. Used on the whisper
+-- over-length degrade path so a byte-truncated message can never end mid-escape
+-- (AUD-306): |H..|h / |c..|r sequences are pure ASCII, so the UTF-8 boundary back-up
+-- doesn't protect them, and a cut inside one throws "Invalid escape code". Reducing
+-- to plain text BEFORE the cut makes truncation safe at any byte. A literal-pipe
+-- escape "||" is protected first (swapped to \1) so the strip patterns can't match
+-- at its second pipe and mangle a following escape-shaped run into a stray "|"
+-- (AUD-407), then restored — "||" is already the correct form to send.
+local function _stripWoWEscapes(s)
+  s = s:gsub("||", "\1")                 -- protect literal-pipe escapes
+  s = s:gsub("|c%x%x%x%x%x%x%x%x", "")   -- color open (|cAARRGGBB)
+  s = s:gsub("|H.-|h(.-)|h", "%1")       -- hyperlink -> its display text
+  s = s:gsub("|T.-|t", "")               -- inline texture
+  s = s:gsub("|A.-|a", "")               -- inline atlas
+  s = s:gsub("|[rhta]", "")              -- stray color/link/texture/atlas closers
+  s = s:gsub("\1", "||")                 -- restore literal-pipe escapes
+  return s
+end
+
+-- Whisper button enable state (AUD-014). A whisper is only valid when the template is
+-- non-empty (an explicitly-cleared "" template renders a useless prefix-only message;
+-- nil never happens — AceDB seeds a default) AND chat is not in messaging lockdown
+-- (boss encounters block addon whispers). ENCOUNTER_START/END toggle these buttons.
+local function _whisperEnabledNow()
+  local db = LootItForward and LootItForward.db
+  local template = db and db.profile.whisperMessage
+  if not template or template == "" then return false end
+  if C_ChatInfo and C_ChatInfo.InChatMessagingLockdown and C_ChatInfo.InChatMessagingLockdown() then
+    return false
+  end
+  return true
+end
+
+-- Applies fn to every open whisper button across all sections.
+local function _forEachWhisperButton(fn)
+  for _, section in pairs(itemSections) do
+    for _, row in pairs(section.candidateRows) do
+      if row.whisperBtn then fn(row.whisperBtn) end
+    end
+  end
+end
+
+-- Force-greys every whisper button. Driven by ENCOUNTER_START, which can fire before
+-- InChatMessagingLockdown() flips, so this greys unconditionally rather than recomputing.
+function LIF.Popup_GreyWhisperButtons()
+  _forEachWhisperButton(function(btn) btn:Disable() end)
+end
+
+-- Recomputes each whisper button's state from the current template + lockdown. Driven
+-- by ENCOUNTER_END (re-enable only once lockdown clears AND the template is non-empty)
+-- and by the settings template edit (enable/disable as the field is filled/cleared).
+function LIF.Popup_RefreshWhisperButtons()
+  local enabled = _whisperEnabledNow()
+  _forEachWhisperButton(function(btn)
+    if enabled then btn:Enable() else btn:Disable() end
+  end)
+end
+
+-- _addCandidateRow(section, candidateData, itemLink): builds a Frame row in a section.
+-- Returns the row Frame.
 local function _addCandidateRow(section, candidateData, itemLink)
   section._rowCounter = section._rowCounter + 1
   section.rowOrder[candidateData.guid] = section._rowCounter
@@ -472,11 +750,15 @@ local function _addCandidateRow(section, candidateData, itemLink)
   row:SetPoint("TOPLEFT", section.sectionFrame, "TOPLEFT", 0, -SECTION_HEADER_H)
 
   -- Dedicated info-area hover zone covering only the name+ilvl region (left side).
+  -- AUD-422 intentional: the -88 inset excludes the actions column, so the compare
+  -- tooltip does NOT fire while hovering the Whisper/Trade buttons (they consume the
+  -- hover) — a deliberate no-conflict layout, not a missing tooltip.
   local infoZone = CreateFrame("Frame", nil, row)
   infoZone:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
   infoZone:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -88, 0)
   infoZone:EnableMouse(true)
   infoZone:SetScript("OnEnter", function(self)
+    if not section.itemData.link then return end  -- guard nil (AUD-308); ClassifyItem guarantees it
     LIFItemTooltip:SetOwner(UIParent, "ANCHOR_NONE")
     LIFItemTooltip:ClearAllPoints()
     LIFItemTooltip:SetPoint("TOPLEFT", frame, "TOPRIGHT", 5, 0)
@@ -536,12 +818,43 @@ local function _addCandidateRow(section, candidateData, itemLink)
   whisperBtn:GetFontString():SetJustifyH("CENTER")
   whisperBtn:SetScript("OnClick", function()
     if LIF.examplePopupActive then return end  -- no-op in example mode (D-19)
+    -- Hard backstop (AUD-014): never whisper while chat is in messaging lockdown
+    -- (boss encounter) even if the button's greyed state lags the ENCOUNTER_START
+    -- event. SendChatMessage would throw ADDON_ACTION_BLOCKED here.
+    if C_ChatInfo and C_ChatInfo.InChatMessagingLockdown and C_ChatInfo.InChatMessagingLockdown() then
+      LIF.Log("popup: whisper suppressed — chat messaging lockdown (boss encounter)")
+      return
+    end
     local target = candidateData.whisperTarget or candidateData.name or "?"
     local link = section.itemData.link
     local template = (LootItForward and LootItForward.db and LootItForward.db.profile.whisperMessage)
-                     or "Hey, {link} dropped for me and I don't need it. Do you want it?"
-    local rendered = string.gsub(template, "{link}", link)
-    local msg = "[Loot It Forward] " .. rendered
+                     or LIF.DEFAULT_WHISPER_TEMPLATE
+    local msg = LIF.RenderWhisperMessage(template, link)
+    -- 255-byte send guard (AUD-014): the client silently truncates an over-length
+    -- whisper, and a cut through an item-link escape sequence throws "Invalid escape
+    -- code" and can disconnect. Degrade to the item NAME (plain text) so a long link
+    -- never yields a broken message, and strip any residual markup the template might
+    -- carry so the cut below is escape-safe regardless of how the template was
+    -- populated (AUD-306) — the editbox normally prevents template escapes, but this
+    -- removes the dependency on that.
+    if #msg > WHISPER_MAX_BYTES then
+      local name = (section.itemData and section.itemData.name) or link
+      msg = _stripWoWEscapes(LIF.RenderWhisperMessage(template, name))
+      if #msg > WHISPER_MAX_BYTES then
+        -- Cut on a UTF-8 char boundary, never mid-sequence: SetMaxLetters caps
+        -- CHARACTERS not bytes, and non-ASCII templates / localized item names can
+        -- still overflow. WoW rejects malformed UTF-8. If the byte just past the cut
+        -- is a continuation byte (0x80-0xBF) the cut is mid-character, so back it up
+        -- to the preceding lead byte.
+        local cut = WHISPER_MAX_BYTES
+        while cut > 0 do
+          local b = msg:byte(cut + 1)
+          if b and b >= 0x80 and b <= 0xBF then cut = cut - 1 else break end
+        end
+        msg = msg:sub(1, cut)
+      end
+      LIF.Log("popup: whisper over " .. WHISPER_MAX_BYTES .. " bytes — degraded to item name for " .. target)
+    end
     -- C_ChatInfo.SendChatMessage, not the global SendChatMessage (reverting e89b0cf):
     -- confirmed live 2026-07-03 that the global's "silently does nothing for WHISPER"
     -- claim was wrong — C_ChatInfo.SendChatMessage delivers whispers fine. Note this
@@ -554,6 +867,9 @@ local function _addCandidateRow(section, candidateData, itemLink)
     LIF.Log("Whispered " .. tostring(target) .. " about " .. tostring(link), "info")
   end)
   row.whisperBtn = whisperBtn
+  -- A row created mid-encounter (loot arriving during a later boss fight) starts greyed
+  -- if chat is locked down or the template is empty (AUD-014).
+  if not _whisperEnabledNow() then whisperBtn:Disable() end
 
   -- [Trade]: calls InitiateTrade(unit); TRADE_SHOW listener auto-populates item.
   local tradeBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
@@ -592,15 +908,24 @@ end
 -- Lazily creates the frame if needed, then applies the saved position.
 function LIF.Popup_RestorePosition()
   if not frame then createPopupFrame() end
-  local pos = LootItForward and LootItForward.db and LootItForward.db.char.popupPosition
-  local x, y
-  if pos and pos.y and pos.y > 0 then
-    x, y = pos.x, pos.y
-  else
-    -- y must be positive: TOPLEFT anchored to UIParent BOTTOMLEFT, negative/zero y is off-screen.
-    x, y = _defaultPopupPosition()
-  end
   frame:ClearAllPoints()
+  local pos = LootItForward and LootItForward.db and LootItForward.db.char.popupPosition
+  -- Saved position if valid AND on the current screen (a save from a larger
+  -- resolution that now lands off-screen is dropped below).
+  if _hasSavedPosition(pos) and _isOnScreen(pos.x, pos.y) then
+    frame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", pos.x, pos.y)
+    LIF.Log("popup: position restored x=" .. pos.x .. " y=" .. pos.y)
+    return
+  end
+  -- No usable save: clear a corrupt/off-screen value, then centre on the frame's
+  -- CURRENT rendered height — not FRAME_MIN_HEIGHT. A reset (button or /lif resetpos)
+  -- while a content-filled popup is open must land where the next ShowPopup would, or
+  -- the popup sits low here and jumps up on the following show (V-01). At init the
+  -- frame is still min-height, so this matches the old behaviour there.
+  if pos and LootItForward and LootItForward.db then
+    LootItForward.db.char.popupPosition = nil
+  end
+  local x, y = _defaultPopupPosition(frame:GetHeight())
   frame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", x, y)
   LIF.Log("popup: position restored x=" .. x .. " y=" .. y)
 end
@@ -611,6 +936,15 @@ end
 -- ============================================================
 
 function LIF.ShowPopup(itemData, candidates)
+  -- A real drop always evicts a live example/preview popup (AUD-002). The example
+  -- shares this frame, so without this the real section would stack UNDER the fake
+  -- rows and examplePopupActive would suppress the real Whisper/Trade buttons. This
+  -- covers the post-combat scanning window that the M5 combat-start dismiss
+  -- (Popup_DismissExample) does not — a real drop can call ShowPopup seconds after
+  -- combat ends, while an example opened during that window is still up. dismissPopup
+  -- clears examplePopupActive as part of teardown, so the rebuild below runs clean.
+  if LIF.examplePopupActive then dismissPopup() end
+
   -- Lazily create the frame
   if not frame then createPopupFrame() end
 
@@ -644,61 +978,25 @@ function LIF.ShowPopup(itemData, candidates)
 
   _recalcFrameHeight()
 
-  -- Recompute the centered default now that the frame has grown to fit its content
-  -- (not just at OnInitialize, and not before _recalcFrameHeight — the frame anchors
-  -- TOPLEFT and grows downward, so centering against FRAME_MIN_HEIGHT before content
-  -- is added leaves the actual box off-center vertically). Only for characters with
-  -- no saved (dragged) position — never overrides a real dragged position (2026-07-03).
+  -- Re-anchor on every show. With NO saved position, recompute the centered default
+  -- now that the frame has grown to fit its content (not just at OnInitialize, and not
+  -- before _recalcFrameHeight — the frame anchors TOPLEFT and grows downward, so
+  -- centering against FRAME_MIN_HEIGHT before content is added leaves the box off-center
+  -- vertically; 2026-07-03). With a saved position, re-apply it: a mid-drag dismiss
+  -- (AUD-307) freezes the frame at an abandoned, UNSAVED drag point, so without this
+  -- every later popup this session would open there instead of the saved spot (AUD-406).
+  -- Idempotent for a deliberate drag, which is saved on mouse-up.
   local pos = LootItForward and LootItForward.db and LootItForward.db.char.popupPosition
-  if not (pos and pos.y and pos.y > 0) then
+  frame:ClearAllPoints()
+  if not _hasSavedPosition(pos) then
     local x, y = _defaultPopupPosition(frame:GetHeight())
-    frame:ClearAllPoints()
+    frame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", x, y)
+  else
+    local x, y = _resolvePopupPosition()
     frame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", x, y)
   end
 
   LIF.Log("popup: ShowPopup item=" .. tostring(itemData and itemData.link))
-end
-
-function LIF.Popup_UpdateCandidate(guid, candidateData, itemLink)
-  local section = itemSections[itemLink]
-  if not section then
-    LIF.Log("popup: UpdateCandidate no section for item=" .. tostring(itemLink))
-    return
-  end
-
-  if not section.candidateRows[guid] then
-    _addCandidateRow(section, candidateData, itemLink)
-    _recalcFrameHeight()
-  end
-end
-
-function LIF.Popup_RemoveCandidate(guid, itemLink)
-  local section = itemSections[itemLink]
-  if not section then return end
-
-  -- Remove the candidate row if it exists
-  local row = section.candidateRows[guid]
-  if row then
-    row:Hide()
-    row:SetParent(nil)
-    section.candidateRows[guid] = nil
-    section.candidateDataByGuid[guid] = nil
-  end
-
-  -- Cascade: if section is now empty, remove it
-  if not next(section.candidateRows) then
-    _removeSection(itemLink)
-    -- If no sections remain, dismiss the popup
-    if not next(itemSections) then
-      dismissPopup()
-      return
-    end
-  end
-
-  -- Recalculate height if frame is still shown
-  if frame and frame:IsShown() then
-    _recalcFrameHeight()
-  end
 end
 
 -- Roster update callback — called by LootItForward:GROUP_ROSTER_UPDATE
@@ -707,6 +1005,11 @@ end
 -- then apply removals — never mutate tables while iterating with pairs().
 function LIF.Popup_OnRosterUpdate()
   if not frame or not frame:IsShown() then return end
+  -- The example/preview popup uses fabricated GUIDs that never resolve to a unit,
+  -- so pruning would remove every row and dismiss it on ANY roster churn while
+  -- previewing (AUD-020). Roster changes are irrelevant to a static preview —
+  -- leave it untouched.
+  if LIF.examplePopupActive then return end
 
   -- Pass 1: collect departed guids per section and empty section itemLinks
   local sectionsToRemove = {}
@@ -774,9 +1077,21 @@ local EXAMPLE_ITEM_LINK = LIF.EXAMPLE_ITEM_LINK
 -- Called by Phase 5's "Show Example Popup" settings button.
 -- Useful for developer positioning and visual testing without a live dungeon.
 function LIF.ShowExamplePopup()
+  -- Block the example popup when it could collide with real activity: in combat
+  -- (real loot arrives mid/post-fight) and while a real loot popup is already
+  -- showing (the example would append its fabricated rows to the live popup —
+  -- the same interleave M5 guards from the other direction). An example popup
+  -- already up is fine to re-render.
+  if InCombatLockdown() then
+    LIF.Print("Example popup is unavailable in combat.")
+    return
+  end
+  if frame and frame:IsShown() and not LIF.examplePopupActive then
+    LIF.Print("Close the active loot popup before showing the example.")
+    return
+  end
   C_Item.RequestLoadItemDataByID(LIF.EXAMPLE_ITEM_ID)  -- warm cache so hover tooltip is correct
   dismissPopup()                          -- clear any previous example before reshowing
-  LIF.examplePopupActive = true
   local fakeLink = EXAMPLE_ITEM_LINK
   local fakeName = "Greathelm of Temptation"
   local fakeIlvl = 220
@@ -813,5 +1128,10 @@ function LIF.ShowExamplePopup()
   }
 
   LIF.ShowPopup(fakeItemData, { fakeCandidate1, fakeCandidate2 })
+  -- Set AFTER ShowPopup: the new evict-example guard at the top of ShowPopup would
+  -- otherwise dismiss the example we are building (self-eviction). The Whisper/Trade
+  -- button closures read this flag at CLICK time, so setting it now still suppresses
+  -- them in example mode (D-19) — behaviour-identical to setting it before.
+  LIF.examplePopupActive = true
   LIF.Log("popup: ShowExamplePopup called")
 end

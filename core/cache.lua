@@ -16,9 +16,23 @@ function LIF.InitLog(savedVar, version)
   log.inspectRecords = log.inspectRecords or {}
   logEntries = log.entries
   inspectRecords = log.inspectRecords
-  while #logEntries > LOG_MAX do table.remove(logEntries, 1) end
+  -- >= so trimming leaves room for the session header appended next (else the
+  -- buffer overflows to LOG_MAX+1 and never recovers — AUD-314).
+  while #logEntries >= LOG_MAX do table.remove(logEntries, 1) end
   table.insert(logEntries, { t = date("!%H:%M:%S"), msg = "=== SESSION " .. log.session .. " v" .. version .. " ===" })
   return log
+end
+
+-- Chat prefix for user-facing output: the spaced display name in gold. Used by
+-- LIF.Print (command replies, notices) and the "info" log level below, so every
+-- non-debug line the user sees carries one consistent, coloured prefix. The debug
+-- stream keeps the short "[LIF]" tag.
+LIF.CHAT_PREFIX = "|cffffff00[Loot It Forward]|r "
+
+-- Ungated user-facing print (command replies, one-off notices). Always shown,
+-- regardless of debugMode or showChatNotifications — a typed command must answer.
+function LIF.Print(msg)
+  DEFAULT_CHAT_FRAME:AddMessage(LIF.CHAT_PREFIX .. msg)
 end
 
 -- level: "debug" (default) = only when debugMode on, recorded to buffer
@@ -29,7 +43,7 @@ function LIF.Log(msg, level)
     local show = not (LootItForward and LootItForward.db)
                  or LootItForward.db.profile.showChatNotifications
     if show then
-      DEFAULT_CHAT_FRAME:AddMessage("|cffffff00[Loot It Forward]|r " .. msg)
+      DEFAULT_CHAT_FRAME:AddMessage(LIF.CHAT_PREFIX .. msg)
     end
     return
   end
@@ -37,7 +51,9 @@ function LIF.Log(msg, level)
   DEFAULT_CHAT_FRAME:AddMessage("|cffffff00[LIF]|r " .. msg)
   if logEntries then
     table.insert(logEntries, { t = date("!%H:%M:%S"), msg = msg })
-    if #logEntries > LOG_MAX then table.remove(logEntries, 1) end
+    -- while (not if) so any excess is fully trimmed, matching RecordInspect and
+    -- recovering a legacy oversized buffer in one insert (AUD-314).
+    while #logEntries > LOG_MAX do table.remove(logEntries, 1) end
   end
 end
 
@@ -79,6 +95,12 @@ function LIF.Cache.Remove(guid)
   cache[guid] = nil
 end
 
+-- Marks a member COMPLETE and MERGES the given fields (does NOT replace): keys
+-- absent from `data` keep their previous value. Callers refreshing a member must
+-- therefore pass EVERY field — a nil-valued field is omitted from the table
+-- literal (Lua drops nil keys), so its stale value would silently survive. See
+-- AUD-013: the sole caller normalizes specID to 0 so a member who lost their spec
+-- selection can never resurrect a previous specID and be wrongly evaluated.
 function LIF.Cache.SetComplete(guid, data)
   if cache[guid] then
     cache[guid].state = "COMPLETE"

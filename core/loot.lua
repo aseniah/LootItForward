@@ -19,6 +19,7 @@ local EQUIP_LOC_SLOTS = {
   INVTYPE_BACK          = {15},
   INVTYPE_CLOAK         = {15},   -- WoW API uses INVTYPE_CLOAK for back items
   INVTYPE_WEAPON        = {16},
+  INVTYPE_WEAPONMAINHAND = {16},  -- main-hand-only weapons (SpecWeaponHands handles them)
   INVTYPE_RANGED        = {16},   -- legacy ranged items (bows); MH slot since MoP
   INVTYPE_RANGEDRIGHT   = {16},   -- bows, guns, crossbows, wands; MH slot since MoP
   INVTYPE_2HWEAPON      = {16, 17},
@@ -31,6 +32,10 @@ local EQUIP_LOC_SLOTS = {
 -- Armor subclassID → human-readable type string (locale-safe, spike 011)
 -- Only valid when classID == 4 (Armor). Holdable uses subID=0, shield uses subID=6 — neither is in SUBCLASS_ARMOR (classID=4 only), so they skip this table.
 local SUBCLASS_ARMOR = {[1] = "Cloth", [2] = "Leather", [3] = "Mail", [4] = "Plate"}
+-- Exposed for the AUD-005 drift guard: the armor gate (below) compares values from
+-- this table against LIF.ARMOR_TYPE (armor_data.lua) by raw equality, so a test
+-- asserts the two vocabularies stay identical.
+LIF.SUBCLASS_ARMOR = SUBCLASS_ARMOR
 
 -- Primary stat keys for GetItemStats scanning (REV-021).
 -- Multi-primary-stat items return MULTIPLE single-stat keys simultaneously —
@@ -81,6 +86,42 @@ local function itemWowheadURL(link)
 end
 
 -- ============================================================
+-- Verbose decision-logging formatters. Produce compact, stable key=value
+-- strings so a post-run SavedVariables read reconstructs every input to an
+-- eligibility decision. Reused by the drop header, the per-member cmp line,
+-- and the player self-check line.
+-- ============================================================
+
+-- Dropped weapon/off-hand hand label from equipLoc; nil for non-weapon slots,
+-- so the header omits "hand=" for armor/neck/back/ring/trinket.
+local WEAPON_HAND_LABEL = {
+  INVTYPE_2HWEAPON       = "2h",
+  INVTYPE_WEAPON         = "1h",
+  INVTYPE_WEAPONMAINHAND = "mh",
+  INVTYPE_WEAPONOFFHAND  = "oh",
+  INVTYPE_RANGED         = "ranged",
+  INVTYPE_RANGEDRIGHT    = "ranged",
+  INVTYPE_SHIELD         = "shield",
+  INVTYPE_HOLDABLE       = "held",
+}
+
+-- One-line header for a classified drop: name, ilvl, category, weapon hand-type,
+-- the dropped item's primary-stat set, and a wowhead URL (falls back to
+-- id=<itemID> when the link is unavailable).
+function LIF.FormatDropHeader(itemData, itemLink, itemID)
+  local hand = WEAPON_HAND_LABEL[itemData.equipLoc]
+  return "item " .. tostring(itemData.name)
+    .. " ilvl=" .. tostring(itemData.ilvl)
+    .. " cat=" .. tostring(itemData.slotCategory)
+    .. (hand and (" hand=" .. hand) or "")
+    .. " stats=" .. statSetLabel(itemData.primaryStats)
+    .. " " .. (itemWowheadURL(itemLink) or ("id=" .. tostring(itemID)))
+end
+
+-- FormatDecisionGear (the per-slot equipped-gear summary) lives lower in this
+-- file, after isHeirloomActive, since it depends on that module-local.
+
+-- ============================================================
 -- LIF.IsLocalPlayerName(playerName)
 -- Self-filter for ENCOUNTER_LOOT_RECEIVED. Its playerName follows
 -- GetUnitName(unit, true) semantics (warcraft.wiki.gg): same-realm players —
@@ -105,14 +146,21 @@ function LIF.IsLocalPlayerName(playerName)
 end
 
 -- ============================================================
--- Pending loot item state (exported so Plans 03-03/04/05 can append/read)
+-- Pending loot item state (exported for queue.lua's departed-member prune and the test harness)
 -- Each entry: { itemData = {...}, t = time(), confirmedCandidates = {}, scanningGuids = {} }
 -- ============================================================
 LIF.pendingLootItems = {}
 
+-- Bumped by Loot_Reset to cancel in-flight pre-entry work (AUD-010). The
+-- tradeability phase runs in raw C_Timer.After closures that Loot_Reset cannot
+-- reach through pendingLootItems; each captures this generation and bails if a
+-- reset changed it. Same closure-vs-reset pattern as queue.lua's inspectGeneration.
+LIF._lootGeneration = 0
+
 -- ============================================================
 -- LIF.GetSlotCategory(equipLoc, classID, subID)
--- Returns: "armor" | "ring" | "trinket" | "weapon" | "neck" | "back" | "skip"
+-- Returns: "armor" | "ring" | "trinket" | "weapon" | "offhand" | "neck" | "back" | "skip"
+-- ("offhand" is the D-07 shield/holdable/off-hand category, distinct from "weapon".)
 -- ============================================================
 local function GetSlotCategory(equipLoc, classID, subID)
   if not equipLoc or equipLoc == "" or equipLoc == "INVTYPE_NON_EQUIP_IGNORE" then
@@ -226,9 +274,10 @@ local function GetItemPrimaryStats(itemLink, equipLoc, classID, subID)
   -- All non-armor equippable slots: scan for primary stat keys.
   -- If the item has none (e.g. a ring with only secondary stats), returns nil
   -- and the caller falls back to ilvl-only comparison.
-  -- GetItemStats is deprecated; prefer C_Item.GetItemStats in modern retail.
+  -- C_Item.GetItemStats only: the bare GetItemStats global was removed from retail, so a
+  -- fallback to it is unreachable in-game and would only ever be taken by a stale mock.
   if equipLoc ~= "" and equipLoc ~= nil then
-    local getStatsFn = (C_Item and C_Item.GetItemStats) or GetItemStats
+    local getStatsFn = C_Item and C_Item.GetItemStats
     if not getStatsFn then return nil end
     local ok, stats = pcall(getStatsFn, itemLink)
     if not ok then
@@ -302,24 +351,13 @@ end
 LIF.ClassifyItem = ClassifyItem
 
 -- ============================================================
--- Phase 4 popup callback stubs (Plan 03-05, D-09).
--- Phase 4 (ui/popup.lua) overrides these by reassigning LIF.ShowPopup etc.
--- itemLink on Update/Remove routes to the correct item section in multi-item popup (D-09).
--- Each stub is defensive against nil/non-nil args via tostring().
+-- Popup callback stub (D-09). ui/popup.lua overrides LIF.ShowPopup by
+-- reassignment; this no-op keeps the loot pipeline safe to run headless (tests,
+-- pre-UI load). Defensive against nil/non-nil args via tostring().
 -- ============================================================
 function LIF.ShowPopup(itemData, candidates)
   LIF.Log("popup stub: ShowPopup item=" .. tostring(itemData and itemData.link)
     .. " candidates=" .. tostring(candidates and #candidates or 0))
-end
-
-function LIF.Popup_UpdateCandidate(guid, candidateData, itemLink)
-  LIF.Log("popup stub: UpdateCandidate guid=" .. tostring(guid and guid:sub(-6) or "nil")
-    .. " item=" .. tostring(itemLink))
-end
-
-function LIF.Popup_RemoveCandidate(guid, itemLink)
-  LIF.Log("popup stub: RemoveCandidate guid=" .. tostring(guid and guid:sub(-6) or "nil")
-    .. " item=" .. tostring(itemLink))
 end
 
 -- Party slot order for tie-breaking (D-12): party1=1 … party4=4.
@@ -333,11 +371,17 @@ local function _partyOrder(u)
 end
 
 local readPlayerSlotIlvl  -- defined below; forward-declared for OnPlayerLootReceived
+-- Resolves a candidate against its retained gear snapshot when a fresh loot-time
+-- inspect isn't possible/didn't finish. Forward-declared here (needs
+-- _checkMemberEligibility, defined far below) and used by OnPlayerLootReceived.
+local _resolveCandidateFallback
 
+-- Resolution-time chat summary. The drop-time line (OnPlayerLootReceived Step 4b)
+-- already announced the item + that it's being forwarded, so this doesn't repeat
+-- the "not an upgrade for you" header — it just reports the outcome.
 local function _emitLootChatNotif(itemData, sorted)
-  LIF.Log(itemData.name .. " (" .. itemData.ilvl .. ") — not an upgrade for you", "info")
   if #sorted == 0 then
-    LIF.Log("  no party upgrades found", "info")
+    LIF.Log(itemData.name .. " — no party upgrades found.", "info")
   else
     for _, c in ipairs(sorted) do
       local member = LIF.Cache.GetMember(c.guid)
@@ -352,9 +396,20 @@ local function _emitLootChatNotif(itemData, sorted)
   end
 end
 
+-- Whether the current group is at or above the configured minimum party size
+-- (AUD-009). Lives here (a harness-loaded core module) so it is unit-testable;
+-- ShouldBeActive() in the entry file calls it to disable the addon below threshold.
+-- Nil-safe: absent GetNumGroupMembers (offline) reads as 0, absent setting as 2.
+function LIF.GroupMeetsMinPartySize()
+  local minSize = (LootItForward and LootItForward.db and LootItForward.db.profile and LootItForward.db.profile.minPartySize) or 2
+  local groupSize = GetNumGroupMembers and GetNumGroupMembers() or 0
+  return groupSize >= minSize
+end
+
 -- Opens the popup for `entry` once ALL scans have resolved and ≥1 candidate is confirmed.
--- Called after every scan resolve and from the 4-second timeout timer.
+-- Called after every scan resolve and from the adaptive scanning-window timer.
 local function _tryOpenPopup(entry)
+  if entry.cancelled then return end  -- entry was reset on an inactive transition (M12)
   if entry.popupOpened then return end
   if next(entry.scanningGuids) then return end  -- still waiting for scans
   local sorted = {}
@@ -372,23 +427,31 @@ local function _tryOpenPopup(entry)
     _emitLootChatNotif(entry.itemData, sorted)
   end
   if #sorted == 0 then return end
-  -- Phase 5: minPartySize gate (D-10). Nil-safe for absent GetNumGroupMembers in
-  -- offline test harness: treat nil as 0, and groupSize > 0 is required before
-  -- applying the gate so offline tests (groupSize == 0) always fall through.
-  local minSize = (LootItForward and LootItForward.db and LootItForward.db.profile and LootItForward.db.profile.minPartySize) or 2
-  local groupSize = GetNumGroupMembers and GetNumGroupMembers() or 0
-  if groupSize > 0 and groupSize < minSize then return end
+  -- minPartySize is enforced upstream in ShouldBeActive(), not here — do not re-add
+  -- a popup-only gate (AUD-009).
   if LIF.ShowPopup then
     LIF.ShowPopup(entry.itemData, sorted)
   end
   entry.popupOpened = true
 end
+-- Exported so queue.lua can open the popup the moment a departing member unblocks
+-- an entry (all remaining candidates resolved) instead of waiting out the window.
+LIF.Loot_TryOpenPopup = _tryOpenPopup
 
 -- Bag-cache-lag retry budget for OnPlayerLootReceived's tradeability check
--- (see confirmTradeableAndProceed below). ~1.5s total, well under the 4s
--- pending-loot cleanup timer.
+-- (see confirmTradeableAndProceed below). This retry runs BEFORE the pending-loot
+-- entry (and its scanning window) is created, so it races no window timer at all —
+-- the only bound is user-visible latency plus the Loot_Reset generation cancel.
 local TRADE_RETRY_DELAY = 0.3
 local TRADE_RETRY_MAX   = 5
+
+-- Adaptive scanning window (D-10, revised for cache-fallback). The inspect queue
+-- is serial and throttled, so N candidates need proportionally more time to
+-- return fresh data before we stop waiting and fall back to snapshots. Sized by
+-- the number of candidates still awaiting a fresh inspect (after immediate
+-- fallbacks). A full party is at most 4 candidates → 14s worst case.
+local WINDOW_BASE          = 2   -- seconds, floor
+local WINDOW_PER_CANDIDATE = 3   -- seconds added per candidate still scanning
 
 -- ============================================================
 -- Bag scanning utilities
@@ -432,6 +495,30 @@ function LIF.FindItemInBags(itemID)
   return nil, nil
 end
 
+-- LIF.CountItemInBags(itemID) → number of bag slots holding a copy of itemID,
+-- ignoring trade timers. The popup's trade-completion check uses this for an
+-- UNTIMED tradeable item — a BoE/BoU that IsItemTradeable clears via the fast path
+-- with no BIND_TRADE_TIME_REMAINING line. FindTradeableSlot can never see such a
+-- copy, so a presence-by-timer check reads "completed" vacuously on a CANCELLED
+-- trade; a DECREASE in this plain count between TRADE_SHOW and TRADE_CLOSED
+-- distinguishes a real trade (AUD-402), mirroring the timered CountTradeableSlots
+-- decrease (AUD-310).
+function LIF.CountItemInBags(itemID)
+  if not C_Container then return 0 end
+  local count = 0
+  for bag = 0, 4 do
+    local numSlots = C_Container.GetContainerNumSlots(bag)
+    for slot = 1, numSlots do
+      local info = C_Container.GetContainerItemInfo(bag, slot)
+      if info and info.hyperlink
+         and tonumber(info.hyperlink:match("item:(%d+)")) == itemID then
+        count = count + 1
+      end
+    end
+  end
+  return count
+end
+
 -- Returns the plain-text anchor to search for in tooltip lines.
 -- Derives a SHORT prefix (first 5 words) from BIND_TRADE_TIME_REMAINING so
 -- the match is resilient to different GlobalString lengths/versions.
@@ -458,6 +545,7 @@ function LIF.FindTradeableSlot(itemID)
   local anchor = getTradeAnchor()
   if not anchor then return nil, nil end
   local tip = getScanTooltip()
+  local diag = {}   -- per-slot tooltip dumps, emitted only if NO slot matches (AUD-411)
   for bag = 0, 4 do
     local numSlots = C_Container.GetContainerNumSlots(bag)
     for slot = 1, numSlots do
@@ -478,17 +566,64 @@ function LIF.FindTradeableSlot(itemID)
               end
             end
           end
-          -- Log anchor + actual tooltip lines so we can diagnose BIND_TRADE_TIME_REMAINING mismatches.
-          LIF.Log("trade-scan: anchor=«" .. anchor .. "» BIND_TRADE_TIME_REMAINING=«"
-            .. tostring(BIND_TRADE_TIME_REMAINING) .. "»")
-          for i, l in ipairs(lines) do
-            LIF.Log("trade-scan line[" .. i .. "]: " .. l:sub(1, 120))
+          -- No trade-timer line on this matching-itemID slot. Buffer its tooltip
+          -- rather than logging now: a LATER slot may still match (a fresh drop
+          -- behind an owned timerless copy is the documented success layout), and
+          -- dumping on the success path evicts the capped debug log (AUD-411).
+          diag[#diag + 1] = { bag = bag, slot = slot, lines = lines }
+        end
+      end
+    end
+  end
+  -- Reached only when NO slot carried the trade-timer line: emit the buffered dumps
+  -- so a genuine BIND_TRADE_TIME_REMAINING anchor mismatch can be diagnosed.
+  if #diag > 0 then
+    LIF.Log("trade-scan: anchor=«" .. anchor .. "» BIND_TRADE_TIME_REMAINING=«"
+      .. tostring(BIND_TRADE_TIME_REMAINING) .. "»")
+    for _, d in ipairs(diag) do
+      for i, l in ipairs(d.lines) do
+        LIF.Log("trade-scan bag" .. d.bag .. " slot" .. d.slot .. " line[" .. i .. "]: " .. l:sub(1, 120))
+      end
+    end
+  end
+  return nil, nil
+end
+
+-- LIF.CountTradeableSlots(itemID) → number of bag slots holding a tradeable
+-- (active BIND_TRADE_TIME_REMAINING) copy of itemID. The popup's trade-completion
+-- check uses this for the D-03 stacked-drop case: with two tradeable copies of the
+-- same itemID, FindTradeableSlot still finds the second after one is traded, so
+-- presence can't tell "completed" from "cancelled" — a DECREASE in this count
+-- between TRADE_SHOW and TRADE_CLOSED can (AUD-310). Kept separate from
+-- FindTradeableSlot so that load-bearing path is untouched; omits its per-slot
+-- diagnostic logging to avoid spam on repeated counts.
+function LIF.CountTradeableSlots(itemID)
+  if not C_Container then return 0 end
+  local anchor = getTradeAnchor()
+  if not anchor then return 0 end
+  local tip = getScanTooltip()
+  local count = 0
+  for bag = 0, 4 do
+    local numSlots = C_Container.GetContainerNumSlots(bag)
+    for slot = 1, numSlots do
+      local info = C_Container.GetContainerItemInfo(bag, slot)
+      if info and info.hyperlink
+         and tonumber(info.hyperlink:match("item:(%d+)")) == itemID then
+        tip:ClearLines()
+        tip:SetBagItem(bag, slot)
+        for _, region in ipairs({tip:GetRegions()}) do
+          if region:GetObjectType() == "FontString" then
+            local lineText = region:GetText()
+            if lineText and lineText:find(anchor, 1, true) then
+              count = count + 1
+              break
+            end
           end
         end
       end
     end
   end
-  return nil, nil
+  return count
 end
 
 function LIF.IsItemTradeable(itemLink, itemID)
@@ -498,6 +633,15 @@ function LIF.IsItemTradeable(itemLink, itemID)
     -- Account-bound: never player-tradeable.
     if bindType == 7 or bindType == 8 or bindType == 9 then
       LIF.Log("loot skip: account-bound itemID=" .. tostring(itemID))
+      return false
+    end
+
+    -- Quest-bound (4): never player-tradeable. Must be caught before the
+    -- "not BoP → tradeable" fast-path below, which would otherwise wave it
+    -- through. (Bind-on-Use (3) is genuinely tradeable while unbound, so it
+    -- is deliberately NOT skipped here.)
+    if bindType == 4 then
+      LIF.Log("loot skip: quest-bound itemID=" .. tostring(itemID))
       return false
     end
 
@@ -561,17 +705,45 @@ function LIF.FlushAfterCombatCallbacks()
 end
 
 -- ============================================================
+-- LIF.Loot_Reset()
+-- Clears all in-flight loot state on an inactive transition (leaving the group,
+-- zoning into excluded content, addon disable). Marks each pending entry
+-- `cancelled` so its still-live window timer no-ops when it fires (the timer and
+-- _tryOpenPopup both check the flag), empties the entry so nothing can be shown,
+-- then drops the list and any deferred after-combat callbacks. Without this a
+-- surviving window timer could open a popup for a group that's already gone, or a
+-- stale after-combat callback could replay the pipeline on the next combat (M12).
+-- ============================================================
+function LIF.Loot_Reset()
+  -- Invalidate any in-flight tradeability-phase closures (AUD-010): they run in
+  -- raw C_Timer.After timers not tracked by pendingLootItems / _afterCombatCallbacks.
+  LIF._lootGeneration = (LIF._lootGeneration or 0) + 1
+  for _, entry in ipairs(LIF.pendingLootItems or {}) do
+    entry.cancelled = true
+    entry.scanningGuids = {}
+    entry.confirmedCandidates = {}
+  end
+  LIF.pendingLootItems = {}
+  LIF._afterCombatCallbacks = {}
+end
+
+-- ============================================================
 -- LIF.OnPlayerLootReceived(itemLink, itemID[, opts])
 -- Entry point for ENCOUNTER_LOOT_RECEIVED (wired in Plan 03-05).
 -- Full pipeline: classify → self-upgrade check → one-frame defer →
 -- tradeability check → queue PENDING members → EvaluateCandidates →
--- append pendingLootItems entry → 4-second cleanup timer.
+-- append pendingLootItems entry → adaptive scanning-window timer.
 -- NOTE: ShowPopup is NOT called here — deferred to OnLootInspectReady (D-08).
 -- opts (optional, for /lif force-loot debug command):
 --   skipSelfCheck: bool  — bypass IsPlayerUpgrade check
 --   threshold: number    — override the default delta > 0 threshold for both self and member checks
 -- ============================================================
 function LIF.OnPlayerLootReceived(itemLink, itemID, opts)
+  -- Capture the loot generation for the WHOLE pipeline (AUD-010). Taken before
+  -- Step 0 so a Loot_Reset landing during the async item-load wait below also
+  -- cancels this drop, not just the later tradeability timers.
+  local lootGen = LIF._lootGeneration
+
   -- Step 0: defer if item data is not yet cached (REV-008).
   -- GetItemInfo returns nil for items the client hasn't seen (e.g. first kill
   -- of a new boss) — exactly the drops worth evaluating. Defer ONE retry via
@@ -582,6 +754,13 @@ function LIF.OnPlayerLootReceived(itemLink, itemID, opts)
       if item and not item:IsItemEmpty() then
         LIF.Log("loot defer: item data not cached " .. tostring(itemLink))
         item:ContinueOnItemLoad(function()
+          -- Bail if a reset happened during the item-load wait (AUD-010): the
+          -- re-call would otherwise capture a fresh generation and proceed against
+          -- the cleared state. The re-call itself captures its own current gen.
+          if LIF._lootGeneration ~= lootGen then
+            LIF.Log("loot cancel: pipeline reset during item-load for " .. tostring(itemLink))
+            return
+          end
           local retryOpts = { _retried = true }
           if opts then
             for k, v in pairs(opts) do retryOpts[k] = v end
@@ -600,24 +779,46 @@ function LIF.OnPlayerLootReceived(itemLink, itemID, opts)
     LIF.Log("loot skip: classification nil for " .. tostring(itemLink))
     return
   end
-  LIF.Log("item " .. tostring(itemData.name)
-    .. " ilvl=" .. tostring(itemData.ilvl)
-    .. " cat=" .. tostring(itemData.slotCategory)
-    .. " " .. (itemWowheadURL(itemLink) or ("id=" .. tostring(itemID))))
+  -- ilvl underpins every downstream comparison (self-check delta, member
+  -- eval's droppedIlvl arithmetic, the chat concat). ClassifyItem normally
+  -- bails before this on a nil GetItemInfo, but if a name arrives without an
+  -- item level, skip rather than proceed into nil arithmetic.
+  if itemData.ilvl == nil then
+    LIF.Log("loot skip: nil ilvl for " .. tostring(itemLink))
+    return
+  end
+  LIF.Log(LIF.FormatDropHeader(itemData, itemLink, itemID))
+
+  -- A local player with no active spec (below level 10, or spec never chosen)
+  -- can't be self-checked: the stat/weapon self-upgrade branches fail closed,
+  -- which for the LOCAL player inverts to "not an upgrade for me → offer it
+  -- away" and risks giving away the player's own upgrade. Nothing reliable to
+  -- compare against, so ignore the drop rather than guess. (Skipped when the
+  -- caller explicitly bypasses the self-check.)
+  if not (opts and opts.skipSelfCheck) then
+    local specIndex = GetSpecialization and GetSpecialization()
+    local playerSpecID = specIndex and specIndex > 0 and GetSpecializationInfo(specIndex)
+    if not playerSpecID then
+      LIF.Log("loot skip: local player has no active spec")
+      return
+    end
+  end
 
   -- Step 2: self-upgrade check (D-13).
   local threshold = (opts and opts.threshold ~= nil and opts.threshold) or 1
-  if not (opts and opts.skipSelfCheck) and LIF.IsPlayerUpgrade(itemData, threshold) then
-    LIF.Log("loot self-upgrade skip " .. tostring(itemLink))
-    if GetNumGroupMembers and GetNumGroupMembers() > 0 then
-      local slotIDs = itemData.slotIDs or {}
-      local curr1 = slotIDs[1] and readPlayerSlotIlvl(slotIDs[1]) or 0
-      local curr2 = slotIDs[2] and readPlayerSlotIlvl(slotIDs[2]) or nil
-      local currIlvl = curr2 and math.min(curr1, curr2) or curr1
-      LIF.Log(itemData.name .. " (" .. itemData.ilvl .. ") — upgrade for you (+"
-        .. (itemData.ilvl - currIlvl) .. " ilvl)", "info")
+  if not (opts and opts.skipSelfCheck) then
+    local isSelfUpgrade, selfBasis = LIF.IsPlayerUpgrade(itemData, threshold)
+    if isSelfUpgrade then
+      LIF.Log("loot self-upgrade skip " .. tostring(itemLink))
+      -- Use the basis the decision actually used, not a fresh min recompute, so
+      -- the chat delta matches the decision (L1). selfBasis is always set on the
+      -- upgrade path, but guard defensively.
+      if GetNumGroupMembers and GetNumGroupMembers() > 0 and selfBasis then
+        LIF.Log(itemData.name .. " (" .. itemData.ilvl .. ") — upgrade for you (+"
+          .. (itemData.ilvl - selfBasis) .. " ilvl)", "info")
+      end
+      return
     end
-    return
   end
 
   -- Steps 3-7: defer one frame so bags settle, then confirm tradeability before
@@ -631,6 +832,15 @@ function LIF.OnPlayerLootReceived(itemLink, itemID, opts)
   -- untradeable result), retry every TRADE_RETRY_DELAY up to
   -- TRADE_RETRY_MAX times before giving up.
   local function confirmTradeableAndProceed(attempt)
+    -- Bail if a Loot_Reset happened since this pipeline started (AUD-010): the
+    -- group disbanded / went inactive, so proceeding would emit a stale chat line
+    -- and append an orphan pending entry. Covers all re-entry paths (initial
+    -- defer, bag-cache retry, combat-defer). lootGen is captured at the top of
+    -- OnPlayerLootReceived (above Step 0).
+    if LIF._lootGeneration ~= lootGen then
+      LIF.Log("loot cancel: pipeline reset before tradeability for " .. tostring(itemData.name))
+      return
+    end
     attempt = attempt or 0
     if not LIF.IsItemTradeable(itemLink, itemID) then
       local stillArriving = C_Container and LIF.FindItemInBags(itemID) == nil
@@ -644,7 +854,7 @@ function LIF.OnPlayerLootReceived(itemLink, itemID, opts)
     end
 
     -- Reinspects can't run during combat (CanScanUnit → InCombatLockdown), and
-    -- starting the 4-second scanning window now would let it expire before combat
+    -- starting the scanning window now would let it expire before combat
     -- drops, dropping members whose inspect never got to run. Defer the whole
     -- scan + window until combat ends by re-entering this function post-combat;
     -- the tradeability recheck then is cheap and also catches an item removed
@@ -664,6 +874,18 @@ function LIF.OnPlayerLootReceived(itemLink, itemID, opts)
     local eval = LIF.EvaluateCandidates(itemData, threshold)
     local scanningGuids = eval.scanningGuids or {}
 
+    -- Step 4b: announce the drop + prefilter candidate count (info chat line, so
+    -- the player knows LIF saw the drop and is working). Count is the prefilter
+    -- total, before any fallback resolves. "Inspecting..." only when there's work.
+    local candidateCount = 0
+    for _ in pairs(scanningGuids) do candidateCount = candidateCount + 1 end
+    if candidateCount > 0 then
+      LIF.Log(itemData.name .. " dropped — " .. candidateCount .. " possible "
+        .. (candidateCount == 1 and "candidate" or "candidates") .. ". Inspecting...", "info")
+    else
+      LIF.Log(itemData.name .. " dropped — 0 possible candidates.", "info")
+    end
+
     -- Step 5: build and append pending loot entry.
     -- threshold is stored so OnLootInspectReady uses the same value (not re-read from db).
     local entry = {
@@ -673,16 +895,46 @@ function LIF.OnPlayerLootReceived(itemLink, itemID, opts)
       confirmedCandidates = {},
       scanningGuids       = scanningGuids,
       popupOpened         = false,
+      cancelled           = false,
       hadPartyMembers     = next(scanningGuids) ~= nil,
       chatNotifEmitted    = false,
     }
     table.insert(LIF.pendingLootItems, entry)
 
-    -- Step 6: 4-second scanning window timer (D-10).
-    -- Local-capture pattern (matching queue.lua) prevents upvalue mutation issues.
+    -- Step 5b: immediate cache-fallback. A candidate we can't freshly inspect
+    -- right now — dead, offline, or the local player is dead (which stalls the
+    -- entire inspect queue) — would only fall back at window expiry anyway.
+    -- Resolve it against its snapshot now to avoid a pointless wait. Two-pass
+    -- (collect then resolve) because the resolve mutates scanningGuids.
+    local unscannable = {}
+    for guid in pairs(scanningGuids) do
+      local u = LIF.GuidToUnit(guid)
+      if not (u and LIF.CanScanUnit(u)) then
+        unscannable[#unscannable + 1] = guid
+      end
+    end
+    for _, guid in ipairs(unscannable) do
+      _resolveCandidateFallback(entry, guid)
+    end
+    if #unscannable > 0 then _tryOpenPopup(entry) end
+
+    -- Step 6: adaptive scanning window timer (D-10). Sized by the candidates
+    -- still awaiting a fresh inspect (after the immediate fallbacks above). On
+    -- expiry, any member that never re-completed resolves against its snapshot,
+    -- then the popup opens. Local-capture pattern (matching queue.lua) prevents
+    -- upvalue mutation issues.
+    local remainingCount = 0
+    for _ in pairs(entry.scanningGuids) do remainingCount = remainingCount + 1 end
+    local window = WINDOW_BASE + remainingCount * WINDOW_PER_CANDIDATE
+    entry.window = window  -- diagnostic: how long we waited for fresh data
     local capturedEntry = entry
-    C_Timer.After(4, function()
-      if capturedEntry.scanningGuids then
+    C_Timer.After(window, function()
+      if not capturedEntry.cancelled and capturedEntry.scanningGuids then
+        local remaining = {}
+        for guid in pairs(capturedEntry.scanningGuids) do remaining[#remaining + 1] = guid end
+        for _, guid in ipairs(remaining) do
+          _resolveCandidateFallback(capturedEntry, guid)
+        end
         capturedEntry.scanningGuids = {}
         _tryOpenPopup(capturedEntry)
       end
@@ -696,7 +948,7 @@ function LIF.OnPlayerLootReceived(itemLink, itemID, opts)
 
     -- Step 7: final pipeline log.
     LIF.Log("loot pipeline " .. tostring(itemLink)
-      .. " scanning=" .. tostring(next(scanningGuids) and "yes" or "no"))
+      .. " candidates=" .. remainingCount .. " window=" .. window .. "s")
   end
   C_Timer.After(0, confirmTradeableAndProceed)
 end
@@ -725,11 +977,6 @@ end
 -- Level cap: 69 (literal). Heirlooms scale up to and including level 69;
 -- at level 70 the item behaves as a normal static-ilvl piece (D-03/D-04).
 -- Use `level > 69` (not `level < 70`) to keep the intent explicit.
---
--- In-game verification (2026-05-19, Plan 03.1-03):
---   C_Heirloom.IsItemHeirloom confirmed present — output: function: 0x79585c778.
---   Using IsItemHeirloom branch (not GetHeirloomInfo fallback). D-02 guard retained for
---   future-patch safety only.
 --
 -- Debug bypass: /lif heirloom on (only while debugMode is also on) forces this to
 -- always report false, so heirloom-wearing candidates are no longer skipped — lets
@@ -773,22 +1020,58 @@ local function HeirloomAdjustedIlvl(link, level, ilvl)
   if isHeirloomActive(link, level) then return math.huge end
   return ilvl
 end
+-- Exposed so the popup header's ring/trinket compare (ui/popup.lua) can pick the same
+-- heirloom-adjusted lower-of-two slot the eligibility engine used (AUD-308).
+LIF.HeirloomAdjustedIlvl = HeirloomAdjustedIlvl
+
+-- The equipped slot(s) a category's comparison reads, with display labels.
+-- Paired categories return both slots (the decision uses both); single-slot
+-- categories return the item's target slot from slotIDs.
+local function decisionSlots(cat, itemData)
+  if cat == "ring"    then return { { 11, "s11" }, { 12, "s12" } } end
+  if cat == "trinket" then return { { 13, "s13" }, { 14, "s14" } } end
+  if cat == "weapon" or cat == "offhand" then return { { 16, "mh" }, { 17, "oh" } } end
+  local s = (itemData.slotIDs and itemData.slotIDs[1]) or 0
+  return { { s, "s" .. s } }
+end
+
+-- "<label>:<ilvl> hl:<y|n>" per compared slot, space-joined, for the verbose
+-- decision log. Weapon/off-hand slots read the live accessors (player: live
+-- gear; member: the live accessors collapse onto the cache), every other slot
+-- the standard accessor, matching EvaluateItemForCharacter so the logged basis
+-- equals the decision basis.
+function LIF.FormatDecisionGear(char, cat, itemData)
+  local weaponCat = (cat == "weapon" or cat == "offhand")
+  local getLink = weaponCat and char.getLiveSlotLink or char.getSlotLink
+  local getIlvl = weaponCat and char.getLiveSlotIlvl or char.getSlotIlvl
+  local parts = {}
+  for _, slot in ipairs(decisionSlots(cat, itemData)) do
+    local slotID, label = slot[1], slot[2]
+    local hl = isHeirloomActive(getLink(slotID), char.level) and "y" or "n"
+    parts[#parts + 1] = label .. ":" .. tostring(getIlvl(slotID)) .. " hl:" .. hl
+  end
+  return table.concat(parts, "  ")
+end
 
 -- ============================================================
--- ResolveWeaponCompareSlot(dualSlotCompare, weaponSlot, getIlvl, ohHeirloomActive)
+-- ResolveWeaponCompareSlot(dualSlotCompare, weaponSlot, getIlvl, mhHeirloomActive, ohHeirloomActive)
 -- Shared weapon dual-slot arithmetic (REV-010/D-15): non-dual-wield specs
 -- always compare against weaponSlot; dual-wield specs (or Fury+2H) compare
--- against the weaker of MH/OH, unless OH holds an active heirloom (then MH
--- only — an active heirloom never loses a comparison it can't win anyway).
--- getIlvl(slotID) abstracts live (player) vs cached (party member) reads.
--- Returns (compareSlotID, compareIlvl). Tie goes to slot 16 (main-hand).
+-- against the weaker of MH/OH. If ONE hand holds an active heirloom, judge
+-- against the OTHER (non-heirloom) hand only — an active heirloom never loses a
+-- comparison it can't win anyway (M3). Both-hands-heirloom is filtered by the
+-- caller before this runs. getIlvl(slotID) abstracts live (player) vs cached
+-- (party member) reads. Returns (compareSlotID, compareIlvl). Tie → slot 16.
 -- ============================================================
-local function ResolveWeaponCompareSlot(dualSlotCompare, weaponSlot, getIlvl, ohHeirloomActive)
+local function ResolveWeaponCompareSlot(dualSlotCompare, weaponSlot, getIlvl, mhHeirloomActive, ohHeirloomActive)
   if not dualSlotCompare then
     return weaponSlot, getIlvl(weaponSlot)
   end
   if ohHeirloomActive then
     return 16, getIlvl(16)
+  end
+  if mhHeirloomActive then
+    return 17, getIlvl(17)
   end
   local ilvl16, ilvl17 = getIlvl(16), getIlvl(17)
   if ilvl16 <= ilvl17 then return 16, ilvl16 end
@@ -799,9 +1082,12 @@ end
 -- Is2HWeaponEquipped(unit)
 -- D-11: an off-hand item can never be an upgrade for a unit currently
 -- wielding a two-handed weapon (nothing to hold it in). Shared by the
--- self-check and party-candidate offhand branches — previously only the
--- party path checked this, which meant a 2H-wielding player's own off-hand
--- drops silently misread as self-upgrades (popup never fired for anyone).
+-- self-check and party-candidate offhand branches (both must gate on it).
+-- AUD-301b deferred: matches only INVTYPE_2HWEAPON, not an equipped ranged
+-- weapon (bow/gun) that also occupies both hands. Currently unreachable — the
+-- only ranged-equipping specs (BM/MM Hunter) have an empty offHandWeapon and a
+-- ranged-only mainHand, so they never take a dual/off-hand drop path, and
+-- Survival can't equip ranged. Latent robustness only; see .development findings.
 -- ============================================================
 local function Is2HWeaponEquipped(unit)
   local link = GetInventoryItemLink(unit, 16)
@@ -809,6 +1095,41 @@ local function Is2HWeaponEquipped(unit)
   local _, _, _, _, _, _, _, _, equipLoc = GetItemInfo(link)
   return equipLoc == "INVTYPE_2HWEAPON"
 end
+
+-- ============================================================
+-- PlayerWeaponCompareSlot(itemData) → slotID | nil
+-- The local player's authoritative weapon compare slot for the popup header
+-- hover (AUD-404). Mirrors the slot EvaluateItemForCharacter's weapon branch
+-- picks for the player, so the hover shows the piece eligibility actually
+-- compared against: the weaker hand of a dual-wield pair, the off-hand for an
+-- off-hand-only drop, or the equipped 2H when the empty off-hand isn't fillable
+-- (AUD-301/AUD-401). Returns nil when the item isn't a weapon the player's
+-- spec can use (caller falls back to slotIDs[1]).
+-- ============================================================
+local function PlayerWeaponCompareSlot(itemData)
+  local specIndex = GetSpecialization()
+  local specID = specIndex and specIndex > 0 and GetSpecializationInfo(specIndex)
+  local hands = specID and SpecWeaponHands(specID, itemData.equipLoc, itemData.weaponSubID)
+  if not hands then return nil end
+  local weaponSlot = (hands == "off") and 17 or 16
+  local dualSlotCompare = (hands == "both")
+  local level = UnitLevel("player")
+  local mhHeirloomActive = isHeirloomActive(GetInventoryItemLink("player", 16), level)
+  local ohHeirloomActive = isHeirloomActive(GetInventoryItemLink("player", 17), level)
+  -- On a 2H with an empty off-hand, the empty slot isn't a beatable target — the
+  -- compare is straight against the 2H (slot 16), matching the eligibility branch.
+  if (dualSlotCompare or hands == "off") and itemData.equipLoc ~= "INVTYPE_2HWEAPON"
+     and GetInventoryItemLink("player", 17) == nil and Is2HWeaponEquipped("player") then
+    return 16
+  end
+  local function rawIlvl(slot)
+    local link = GetInventoryItemLink("player", slot)
+    return link and (C_Item.GetDetailedItemLevelInfo(link) or 0) or 0
+  end
+  local slot = ResolveWeaponCompareSlot(dualSlotCompare, weaponSlot, rawIlvl, mhHeirloomActive, ohHeirloomActive)
+  return slot
+end
+LIF.PlayerWeaponCompareSlot = PlayerWeaponCompareSlot
 
 -- ============================================================
 -- EvaluateItemForCharacter(itemData, threshold, char)
@@ -935,10 +1256,53 @@ local function EvaluateItemForCharacter(itemData, threshold, char)
     -- dagger) targets slot 17; otherwise the main-hand (slot 16). Slot reads go
     -- through the char accessors (live for the player, cached for a member).
     local weaponSlot = (hands == "off") and 17 or 16
-    if isHeirloomActive(char.getLiveSlotLink(weaponSlot), char.level) then
-      return false, nil, weaponSlot, "heirloom"
-    end
     local dualSlotCompare = (hands == "both")
+    local mhHeirloomActive = isHeirloomActive(char.getLiveSlotLink(16), char.level)
+    local ohHeirloomActive = isHeirloomActive(char.getLiveSlotLink(17), char.level)
+    if dualSlotCompare then
+      -- An active heirloom in ONE hand doesn't block the drop when the OTHER hand
+      -- holds a beatable non-heirloom weapon — the drop can replace that (M3).
+      -- Skip only when neither hand is a beatable target:
+      --  * both hands hold active heirlooms, OR
+      --  * one hand holds an active heirloom and the other is EMPTY. This is the
+      --    "heirlooms always win" invariant (see M2) applied to a slot that is
+      --    ABOUT to hold a heirloom rather than one that already does: while
+      --    leveling, an empty hand beside an active heirloom gets filled with a
+      --    duplicate heirloom (free to create from the collection, and scaling),
+      --    not a random drop. Comparing the drop against that empty hand (ilvl 0)
+      --    is therefore a false positive.
+      --
+      -- Applies UNIFORMLY — do NOT gate on isPlayer or 2H (AUD-001/AUD-004,
+      -- working-as-intended):
+      --  * dualSlotCompare is reached only by Titan's-Grip 2H (Fury) or an
+      --    either-hand 1H dual-wielder; both can make a second copy of the
+      --    equipped heirloom, so the rule holds for 1H and 2H alike. A 1H+off-hand
+      --    setup (e.g. a mage's weapon + frill) is NOT dualSlotCompare and never
+      --    reaches this branch.
+      --  * For the local PLAYER, EvaluateItemForCharacter returning false means
+      --    "not my upgrade → offer to the party", which is CORRECT here: the player
+      --    fills the empty hand with a duplicate heirloom, not this drop — the
+      --    empty-hand fill is NOT a 0→N self-upgrade (AUD-001/AUD-004).
+      -- This reads only links/heirloom state, never equipLoc, so it is immune to
+      -- the M1 cold-cache is2HEquipped gap.
+      local ohEmpty = char.getLiveSlotLink(17) == nil
+      local mhEmpty = char.getLiveSlotLink(16) == nil
+      if (mhHeirloomActive and ohHeirloomActive)
+         or (mhHeirloomActive and ohEmpty)
+         or (ohHeirloomActive and mhEmpty) then
+        return false, nil, 16, "heirloom"
+      end
+    elseif isHeirloomActive(char.getLiveSlotLink(weaponSlot), char.level) then
+      -- Single-slot weapon: an active heirloom in the target slot is unbeatable.
+      return false, nil, weaponSlot, "heirloom"
+    elseif weaponSlot == 17 and mhHeirloomActive and char.getLiveSlotLink(17) == nil then
+      -- Off-hand-only drop (an Outlaw dagger: the main hand can't hold it) into an
+      -- EMPTY off-hand beside an active MAIN-hand heirloom. Same duplicate-heirloom
+      -- rule as the dual path (AUD-001/M2): the empty hand fills with a scaling
+      -- heirloom copy, not this drop, so comparing vs the ilvl-0 empty slot is a
+      -- false positive.
+      return false, nil, 17, "heirloom"
+    end
     -- Cross-config (D-16): a 2H that REPLACES a current 1H+off-hand setup is
     -- judged against the AVERAGE of the two slots it displaces. Self-gating —
     -- only fires when an off-hand is actually equipped (slot 17 > 0) and the
@@ -947,12 +1311,47 @@ local function EvaluateItemForCharacter(itemData, threshold, char)
     -- 2H is the dual-slot (min) case above, not this one.
     if itemData.equipLoc == "INVTYPE_2HWEAPON" and not dualSlotCompare
        and not char.is2HEquipped() and char.getLiveSlotIlvl(17) > 0 then
+      -- Heirlooms win (M2): a 2H displaces BOTH hands, so an active heirloom in
+      -- the off-hand it forces off is an unbeatable item the member would lose —
+      -- not a real upgrade. Skip rather than average the heirloom's low scaling
+      -- ilvl into the basis (which drags it down and false-positives). A heirloom
+      -- MAIN hand is already caught by the single-slot gate above (weaponSlot 16).
+      if ohHeirloomActive then return false, nil, 16, "heirloom" end
       local pairAvg = math.floor((char.getLiveSlotIlvl(16) + char.getLiveSlotIlvl(17)) / 2)
       if (droppedIlvl - pairAvg) < threshold then return false, pairAvg, 16, "ilvl" end
       return true, pairAvg, 16, "eligible"
     end
-    local ohHeirloomActive = dualSlotCompare and isHeirloomActive(char.getLiveSlotLink(17), char.level)
-    local compareSlot, compareIlvl = ResolveWeaponCompareSlot(dualSlotCompare, weaponSlot, char.getLiveSlotIlvl, ohHeirloomActive)
+    -- Cross-config (D-16): a spec CURRENTLY on a two-hander cannot fill its
+    -- off-hand — a 2H occupies both hands, so the empty slot 17 is not a beatable
+    -- target. Comparing against it (ilvl 0) false-positives every 1H drop. A true
+    -- 1H/off-hand-weapon drop must be judged STRAIGHT against the 2H it would
+    -- replace (slot 16), mirroring the offhand-item branch above. Covers BOTH the
+    -- dual-wield case (dualSlotCompare, min-vs-0 otherwise) AND the off-hand-only
+    -- case (hands=="off": Frost DK/Survival/BrM/WW on a 2H taking a WEAPONOFFHAND
+    -- drop — AUD-401). Excluded: a 2H drop (Fury Titan's Grip) DOES fill the empty
+    -- off-hand with a second two-hander, so it keeps the dual-min below. Ranged
+    -- (bow/gun) is never dualSlotCompare (no off-hand listing) and doesn't reach here.
+    if (dualSlotCompare or hands == "off") and itemData.equipLoc ~= "INVTYPE_2HWEAPON"
+       and char.getLiveSlotLink(17) == nil then
+      -- M1 fail-closed (MEMBERS ONLY): an empty off-hand beside a main-hand whose
+      -- type is unresolved (cold cache → equipLoc nil) could hide a 2H, so
+      -- is2HEquipped can't be trusted here. Skip rather than min-vs-0. An OCCUPIED
+      -- off-hand proves genuine dual-wield, so this is scoped to the empty case.
+      -- The player's own equipLoc is reliably client-cached, so this gates members.
+      if not char.isPlayer and char.getLiveSlotLink(16) and char.getSlotEquipLoc(16) == nil then
+        return false, nil, nil, "main-hand type unresolved"
+      end
+      if char.is2HEquipped() then
+        -- A heirloom main-hand is already caught above: the dualSlotCompare heirloom
+        -- gate (mhHeirloomActive + ohEmpty → "heirloom") for the dual case, and the
+        -- weaponSlot==17 heirloom gate for the hands=="off" case. So the 2H here is
+        -- a beatable non-heirloom weapon.
+        local twoHandIlvl = char.getLiveSlotIlvl(16)
+        if (droppedIlvl - twoHandIlvl) < threshold then return false, twoHandIlvl, 16, "ilvl" end
+        return true, twoHandIlvl, 16, "eligible"
+      end
+    end
+    local compareSlot, compareIlvl = ResolveWeaponCompareSlot(dualSlotCompare, weaponSlot, char.getLiveSlotIlvl, mhHeirloomActive, ohHeirloomActive)
     if (droppedIlvl - compareIlvl) < threshold then return false, compareIlvl, compareSlot, "ilvl" end
     return true, compareIlvl, compareSlot, "eligible"
 
@@ -972,11 +1371,28 @@ local function EvaluateItemForCharacter(itemData, threshold, char)
     if statStatus == "mismatch" then
       return false, nil, nil, "stat mismatch (" .. statSetLabel(itemData.primaryStats) .. "/" .. tostring(memberStat) .. ")"
     end
+    -- M1 fail-closed (MEMBERS ONLY): if a main-hand item exists but its type is
+    -- unresolved (cold item cache even at inspect time → cached equipLoc nil), we
+    -- can't tell whether they wield a 2H. Skip rather than risk the branch below
+    -- comparing this off-hand drop against an empty off-hand slot (ilvl 0 → false
+    -- positive). NOT applied to the local player: there "skip" inverts to "not my
+    -- upgrade → offer it away", and the player's own equipped gear is reliably
+    -- client-cached anyway, so equipLoc there is trustworthy.
+    if not char.isPlayer and char.getLiveSlotLink(16) and char.getSlotEquipLoc(16) == nil then
+      return false, nil, nil, "main-hand type unresolved"
+    end
     -- Cross-config (D-16, supersedes the old D-11 blanket skip): a member on a
     -- 2H CAN switch to 1H + off-hand item, so the item is a candidate — judged
     -- STRAIGHT against the 2H it would (partly) displace (slot 16). Off a 2H, it
     -- simply replaces whatever is in the off-hand slot (17), as before.
     if char.is2HEquipped() then
+      -- Heirlooms win (M2): taking this off-hand means dropping the equipped 2H.
+      -- An active heirloom 2H is unbeatable while leveling, so it's not a real
+      -- upgrade even when the off-hand out-ilvls it. (The slot-17 heirloom case
+      -- for a member NOT on a 2H is handled below.)
+      if isHeirloomActive(char.getLiveSlotLink(16), char.level) then
+        return false, nil, 16, "heirloom"
+      end
       local twoHandIlvl = char.getLiveSlotIlvl(16)
       if (droppedIlvl - twoHandIlvl) < threshold then return false, twoHandIlvl, 16, "ilvl" end
       return true, twoHandIlvl, 16, "eligible"
@@ -1021,6 +1437,7 @@ function LIF.IsPlayerUpgrade(itemData, threshold)
   local playerSpecID = specIndex and specIndex > 0 and GetSpecializationInfo(specIndex)
   local playerLive = function(slot) return GetInventoryItemLink("player", slot) end
   local playerChar = {
+    isPlayer        = true,
     classToken      = playerClassToken,
     specID          = playerSpecID,
     level           = UnitLevel("player"),
@@ -1028,26 +1445,43 @@ function LIF.IsPlayerUpgrade(itemData, threshold)
     getSlotLink     = playerLive,
     getLiveSlotIlvl = readPlayerSlotIlvl,
     getLiveSlotLink = playerLive,
+    -- The player's own equipped gear is reliably client-cached, so a live
+    -- equipLoc read is trustworthy (unlike a party member's — see M1).
+    getSlotEquipLoc = function(slot)
+      local link = GetInventoryItemLink("player", slot)
+      if not link then return nil end
+      return select(9, GetItemInfo(link))
+    end,
     is2HEquipped    = function() return Is2HWeaponEquipped("player") end,
   }
 
-  local eligible, _, _, reason = EvaluateItemForCharacter(data, threshold, playerChar)
+  local eligible, ilvlCurrent, _, reason = EvaluateItemForCharacter(data, threshold, playerChar)
 
-  LIF.Log("self-check " .. tostring(data.equipLoc or data.slotCategory)
-    .. " cat="       .. tostring(data.slotCategory)
-    .. " drop="      .. tostring(data.ilvl)
+  local specLabel = (playerSpecID and LIF.SPEC_LABEL[playerSpecID]) or tostring(playerSpecID or "?")
+  LIF.Log("self-check " .. tostring(playerClassToken) .. " " .. specLabel
+    .. " " .. tostring(data.slotCategory)
+    .. " drop=" .. tostring(data.ilvl)
     .. " threshold=" .. tostring(threshold)
-    .. " result="    .. tostring(eligible)
-    .. " reason="    .. tostring(reason))
+    .. " equip=[" .. LIF.FormatDecisionGear(playerChar, data.slotCategory, data) .. "]"
+    .. " result=" .. tostring(eligible)
+    .. " reason=" .. tostring(reason))
 
-  return eligible
+  -- Return the basis the decision actually used (pair-average for a 2H vs a
+  -- 1H+off-hand, the stat-gated slot, the heirloom-adjusted weapon slot, etc.) so
+  -- the caller's "+X ilvl" chat line matches the decision rather than recomputing
+  -- a possibly-different min (L1). nil on the not-an-upgrade path.
+  return eligible, ilvlCurrent
 end
 
 -- ============================================================
 -- _checkMemberEligibility(itemData, member, unit, threshold) — module-local helper
 -- Used by OnLootInspectReady after fresh inspect data is available.
 -- Nil gear slots are treated as ilvl 0 per D-03.
--- Returns: (eligible: bool, candidate: table|nil)
+-- Returns: (eligible: bool, candidate: table|nil, reason: string)
+--   reason is EvaluateItemForCharacter's reason on the false path ("ilvl",
+--   "heirloom", "stat mismatch (...)", etc.) and "eligible" on the true path.
+--   Internal callers ignore the 3rd value; it exists for LIF.CheckMemberEligibility
+--   (the offline-testable seam — AUD-311) to assert WHY a member was excluded.
 -- ============================================================
 local function _checkMemberEligibility(itemData, member, unit, threshold)
   local _, classToken = UnitClass(unit)
@@ -1070,6 +1504,15 @@ local function _checkMemberEligibility(itemData, member, unit, threshold)
     local g = member.gear and member.gear[slot]
     return g and g.link
   end
+  -- equipLoc captured per slot at inspect time (queue.lua). Reading it from the
+  -- cache — rather than re-calling GetItemInfo(cachedLink) live here — is the M1
+  -- fix: at loot time the item may have aged out of the local cache, so a live
+  -- read returns nil and a real 2H reads as not-2H. Still nil if it couldn't be
+  -- resolved even at inspect time; the offhand branch fails closed on that.
+  local function cachedEquipLoc(slot)
+    local g = member.gear and member.gear[slot]
+    return g and g.equipLoc
+  end
   local memberChar = {
     classToken = classToken,
     specID     = member.specID,
@@ -1078,25 +1521,30 @@ local function _checkMemberEligibility(itemData, member, unit, threshold)
     getSlotLink     = cachedLink,
     getLiveSlotIlvl = cachedIlvl,
     getLiveSlotLink = cachedLink,
+    getSlotEquipLoc = cachedEquipLoc,
     is2HEquipped    = function()
-      local link = cachedLink(16)
-      if not link then return false end
-      return select(9, GetItemInfo(link)) == "INVTYPE_2HWEAPON"
+      return cachedEquipLoc(16) == "INVTYPE_2HWEAPON"
     end,
   }
 
   local eligible, ilvlCurrent, slotID, reason = EvaluateItemForCharacter(itemData, threshold, memberChar)
   local cat = itemData.slotCategory
 
+  local specLabel = (member.specID and LIF.SPEC_LABEL[member.specID]) or tostring(member.specID or "?")
+  local gearStr = LIF.FormatDecisionGear(memberChar, cat, itemData)
+
   if not eligible then
-    LIF.Log("cmp " .. cmpName .. " " .. tostring(cat) .. " -> skip(" .. tostring(reason) .. ")")
-    return false, nil
+    LIF.Log("cmp " .. cmpName .. " " .. tostring(classToken) .. " " .. specLabel
+      .. " " .. tostring(cat) .. " equip=[" .. gearStr .. "] -> skip(" .. tostring(reason) .. ")")
+    return false, nil, reason
   end
 
   local delta = ilvlCurrent and (itemData.ilvl - ilvlCurrent) or nil
-  LIF.Log("cmp " .. cmpName .. " " .. tostring(cat) .. " drop=" .. tostring(itemData.ilvl)
+  LIF.Log("cmp " .. cmpName .. " " .. tostring(classToken) .. " " .. specLabel
+    .. " " .. tostring(cat) .. " drop=" .. tostring(itemData.ilvl)
     .. " curr=" .. tostring(ilvlCurrent) .. " slot=" .. tostring(slotID)
-    .. " delta=+" .. tostring(delta) .. " -> eligible")
+    .. " delta=+" .. tostring(delta)
+    .. " equip=[" .. gearStr .. "] -> eligible")
 
   return true, {
     guid          = member.guid,
@@ -1108,7 +1556,49 @@ local function _checkMemberEligibility(itemData, member, unit, threshold)
     ilvl_dropped  = itemData.ilvl,
     delta         = delta,
     slotID        = slotID,
-  }
+  }, "eligible"
+end
+
+-- Offline-testable eligibility seam (AUD-311): a rename-free alias of the module-
+-- local helper (not a new code path). The same per-member evaluation OnLootInspectReady
+-- runs, exposed for direct unit tests — assert eligible → candidate fields
+-- (delta/slotID/ilvl_current), or ineligible → false + reason.
+LIF.CheckMemberEligibility = _checkMemberEligibility
+
+-- ============================================================
+-- _resolveCandidateFallback(entry, guid) — assigns the forward-declared upvalue.
+-- Resolves a candidate that could not be freshly inspected in time against its
+-- retained gear snapshot (member.gear, preserved by RequestReinspect). Mirrors
+-- the per-entry resolution in OnLootInspectReady but reads the cached snapshot
+-- instead of requiring a fresh COMPLETE. Idempotent: always clears the guid from
+-- scanningGuids. The CALLER opens the popup (_tryOpenPopup) after resolving.
+-- ============================================================
+_resolveCandidateFallback = function(entry, guid)
+  if entry.cancelled then return end
+  if not (entry.scanningGuids and entry.scanningGuids[guid]) then return end
+
+  local member = LIF.Cache.GetMember(guid)
+  local unit   = LIF.GuidToUnit(guid)
+  local hasSnapshot = member and member.gear and next(member.gear) ~= nil
+
+  if member and unit and hasSnapshot then
+    local eligible, candidate = _checkMemberEligibility(entry.itemData, member, unit, entry.threshold or 1)
+    LIF.Log("loot fallback resolve guid=" .. guid:sub(-6) .. " eligible=" .. tostring(eligible))
+    -- A fallback only ever runs while scanningGuids is non-empty (pre-open), so
+    -- the popup is never open here — just record the result; the caller's
+    -- _tryOpenPopup renders it. (No popupOpened branch: it would be dead code.)
+    if eligible then
+      entry.confirmedCandidates = entry.confirmedCandidates or {}
+      entry.confirmedCandidates[guid] = candidate
+    end
+  else
+    -- No snapshot to fall back on (member never successfully scanned, or left the
+    -- group) — genuinely can't evaluate them; drop from the scan set so the popup
+    -- isn't blocked. Logged so it isn't a silent miss.
+    LIF.Log("loot fallback drop guid=" .. guid:sub(-6) .. " — no cached gear")
+  end
+
+  entry.scanningGuids[guid] = nil
 end
 
 -- ============================================================
@@ -1169,21 +1659,26 @@ function LIF.EvaluateCandidates(itemData, threshold)
   for guid, member in pairs(LIF.Cache.GetAll()) do
     local unit = LIF.GuidToUnit(guid)
     if unit ~= nil and unit ~= "player" then
+      -- Live UnitClass (works without inspect; respec-proof — never cached
+      -- member.specID). Used by the armor and weapon/offhand gates and the
+      -- prefilter-skip log line below.
+      local _, unitClassToken = UnitClass(unit)
       local shouldInclude = false
+      local skipReason = "excluded"
 
       if cat == "armor" then
-        -- D-16: armor → filter by live UnitClass (works without inspect)
-        local _, classToken = UnitClass(unit)
-        if classToken and LIF.ARMOR_TYPE[classToken] == armorType then
+        -- D-16: armor → filter by live UnitClass.
+        if unitClassToken and LIF.ARMOR_TYPE[unitClassToken] == armorType then
           shouldInclude = true
+        else
+          skipReason = "armor type mismatch"
         end
 
       elseif cat == "weapon" or cat == "offhand" then
-        -- By-class usability+stat union (respec-proof; live UnitClass, never
-        -- cached member.specID). 2H gate for offhand stays deferred to
+        -- By-class usability+stat union. 2H gate for offhand stays deferred to
         -- _checkMemberEligibility (needs a live slot 16 read).
-        local _, memberClassToken = UnitClass(unit)
-        shouldInclude = ClassCouldUseItem(memberClassToken, itemData)
+        shouldInclude = ClassCouldUseItem(unitClassToken, itemData)
+        if not shouldInclude then skipReason = "class can't use" end
 
       elseif cat == "trinket" or cat == "ring" or cat == "neck" or cat == "back" then
         -- D-16: filter by primary stat when the item has one; include all when it
@@ -1199,6 +1694,7 @@ function LIF.EvaluateCandidates(itemData, threshold)
             shouldInclude = true  -- unknown spec stat mapping → include conservatively
           else
             shouldInclude = statsSet[memberStat] == true
+            if not shouldInclude then skipReason = "stat mismatch" end
           end
         end
 
@@ -1210,6 +1706,12 @@ function LIF.EvaluateCandidates(itemData, threshold)
       if shouldInclude then
         scanningGuids[guid] = true
         LIF.RequestReinspect(guid)
+      else
+        -- Surface members excluded BEFORE reinspect (otherwise invisible in the
+        -- log): the decision record must show who was considered and why they
+        -- were dropped, not just who was inspected.
+        LIF.Log("prefilter skip " .. (UnitName(unit) or unit) .. " "
+          .. tostring(unitClassToken) .. " " .. tostring(cat) .. " -> " .. skipReason)
       end
     end
   end
@@ -1217,22 +1719,17 @@ function LIF.EvaluateCandidates(itemData, threshold)
   return { candidates = {}, scanningGuids = scanningGuids }
 end
 
--- NOTE: LIF.RevalidateCandidates (link re-read revalidation) was removed
--- 2026-06-12 (REV-011). The rescan-all-at-loot design (EvaluateCandidates →
--- RequestReinspect → fresh inspect before popup) supersedes it; see git
--- history if per-candidate link revalidation is ever needed again.
-
 -- ============================================================
 -- LIF.OnLootInspectReady(guid)
 -- SOLE popup opener (D-08). Called after INSPECT_READY resolves a party member.
 -- For each pending loot item that has this guid in scanningGuids, applies full
 -- eligibility using fresh post-inspect gear data (nil slot = 0 ilvl per D-03).
 --
--- Popup lifecycle per entry:
---   - popupOpened == false: accumulate candidates; when ALL scanningGuids resolve,
---     call LIF.ShowPopup with sorted confirmedCandidates (delta desc, D-12 tie-break).
---   - popupOpened == true: call LIF.Popup_UpdateCandidate for new eligible candidates.
---   - Not eligible: call LIF.Popup_RemoveCandidate.
+-- Popup lifecycle per entry: accumulate confirmed candidates as each scan
+-- resolves; _tryOpenPopup opens the popup once ALL scanningGuids have resolved
+-- and ≥1 candidate is confirmed (sorted delta desc, D-12 tie-break). The popup
+-- never opens mid-scan (scanningGuids is only populated at entry creation, never
+-- re-added), so there is no incremental add/remove-candidate path (AUD-311).
 -- ============================================================
 function LIF.OnLootInspectReady(guid)
   if LIF.pendingLootItems == nil or #LIF.pendingLootItems == 0 then return end
@@ -1244,7 +1741,7 @@ function LIF.OnLootInspectReady(guid)
   -- (queue.lua MIN_SLOTS / stabilization gate returns before SetComplete).
   -- Evaluating now would read empty gear as ilvl 0 and confirm false
   -- candidates. Return WITHOUT consuming scanningGuids so the COMPLETE fire
-  -- re-evaluates; the 4-second window timer covers members that never finish.
+  -- re-evaluates; the adaptive scanning-window timer covers members that never finish.
   if member.state ~= "COMPLETE" then return end
 
   local unit = LIF.GuidToUnit(guid)
@@ -1265,17 +1762,6 @@ function LIF.OnLootInspectReady(guid)
     if eligible then
       entry.confirmedCandidates = entry.confirmedCandidates or {}
       entry.confirmedCandidates[guid] = candidate
-      if entry.popupOpened then
-        if LIF.Popup_UpdateCandidate then
-          LIF.Popup_UpdateCandidate(guid, candidate, entry.itemData.link)
-        end
-      end
-    else
-      if entry.popupOpened then
-        if LIF.Popup_RemoveCandidate then
-          LIF.Popup_RemoveCandidate(guid, entry.itemData.link)
-        end
-      end
     end
     _tryOpenPopup(entry)
     end  -- entry.scanningGuids check
@@ -1297,9 +1783,4 @@ end
 function LIF.IsTrinketUpgrade(droppedIlvl, memberTrinkets, threshold)
   local lower = math.min(memberTrinkets.slot13 or 0, memberTrinkets.slot14 or 0)
   return (droppedIlvl - lower) >= threshold
-end
-
--- Returns true if the item's primary stat matches the member's spec primary stat.
-function LIF.IsTrinketCompatible(itemPrimaryStat, memberPrimaryStat)
-  return itemPrimaryStat == memberPrimaryStat
 end
