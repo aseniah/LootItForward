@@ -165,8 +165,13 @@ _mockIlvl = {}  -- tests write: _mockIlvl["itemLink"] = 415
 _mockWuEItems = {}  -- tests write: _mockWuEItems["itemLink"] = true (warbound-until-equipped)
 
 C_Item = {
+  -- nil for an item the client has not cached — NOT 0. The real API returns nil there,
+  -- and 0 is truthy in Lua, so an `or 0` here would make a cold item indistinguishable
+  -- from a resolved ilvl-0 one and no test could ever reach the cold-cache path (AUD-530).
   GetDetailedItemLevelInfo = function(link)
-    return _mockIlvl[link] or 0, 0, 0
+    local ilvl = _mockIlvl[link]
+    if not ilvl then return nil end
+    return ilvl, 0, 0
   end,
   -- REV-023: link-accepting WuE discriminator (in-game verified 2026-06-13).
   IsItemBindToAccountUntilEquip = function(link)
@@ -519,6 +524,17 @@ function IsInInstance()
 end
 
 -- ============================================================
+-- C_Garrison stub — a WoD garrison reports IsInInstance() == true, "party" even
+-- though it is personal outdoor content (confirmed in-game 2026-07-12), so
+-- ComputeActive has to distinguish it from a real 5-player dungeon.
+-- ============================================================
+_mockIsOnGarrisonMap = false
+
+C_Garrison = {
+  IsOnGarrisonMap = function() return _mockIsOnGarrisonMap end,
+}
+
+-- ============================================================
 -- IsInGroup stub (Phase 3)
 -- ============================================================
 _mockIsInGroup = false
@@ -590,8 +606,14 @@ function ResetMocks()
   _mockItemInfo          = {}
   _mockItemStats         = {}
   _mockGetSpecialization = 1
-  _mockSpecializationInfo = {}
+  -- Default the local player to a REAL spec (Arms, STR). Production skips a drop whose
+  -- owner it cannot evaluate (AUD-502), so "player has no spec" is not a usable default
+  -- for the many tests that only care about the member/pipeline side. Tests that care
+  -- about the self-check override _mockSpecializationInfo[1] themselves; tests that want
+  -- a genuinely specless player set _mockGetSpecialization = 0.
+  _mockSpecializationInfo = { [1] = 71 }
   _mockIsInInstance      = { false, "none" }
+  _mockIsOnGarrisonMap   = false
   _mockIsInGroup         = false
 
   -- Phase 3.1 stubs
@@ -627,4 +649,10 @@ function LoadAddonModules(LIF, coreDir)
 
   local lootChunk = assert(loadfile(coreDir .. "/loot.lua"))
   lootChunk(nil, LIF)
+
+  local whisperChunk = assert(loadfile(coreDir .. "/whisper.lua"))
+  whisperChunk(nil, LIF)
+
+  local framePosChunk = assert(loadfile(coreDir .. "/frame_position.lua"))
+  framePosChunk(nil, LIF)
 end

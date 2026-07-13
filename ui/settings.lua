@@ -2,6 +2,13 @@ local _, LIF = ...
 
 -- Example item link/ID shared from ui/popup.lua (REV-017; popup loads first).
 
+-- INVARIANT for this whole file: LootItForward.db exists. OnInitialize assigns it from
+-- AceDB:New() on the line before it calls LIF.InitSettings(), and nothing here runs
+-- earlier — the canvas and every widget handler are built by InitSettings. So db reads
+-- are unguarded (AUD-526); a guard here would only imply the invariant is unreliable.
+-- `.profile` is still dereferenced live on each use, which is a different concern: an
+-- AceDB profile swap replaces the profile TABLE (AUD-325).
+
 local SOUND_OPTIONS = {
   { key = "NONE",                              label = "None / Disabled" },
   { key = "ALARM_CLOCK_WARNING_1",             label = "Alarm Clock (1)" },
@@ -44,6 +51,12 @@ local function buildCanvas()
   title:SetPoint("TOPLEFT", 7, -22)
   title:SetJustifyH("LEFT")
   title:SetText("Loot It Forward")
+
+  -- Baseline-aligned to the title's right edge, so it tracks the title rather than a
+  -- hardcoded offset. LIF.VERSION is set in OnInitialize, before InitSettings runs.
+  local version = canvas:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+  version:SetPoint("BOTTOMLEFT", title, "BOTTOMRIGHT", 8, 3)
+  version:SetText("v" .. (LIF.VERSION or "?"))
 
   local titleDivider = canvas:CreateTexture(nil, "ARTWORK")
   titleDivider:SetPoint("TOPLEFT", 0, -50)
@@ -194,17 +207,37 @@ local function buildCanvas()
   bgEdit:SetSize(504, 64)
   bgEdit:SetColorTexture(0, 0, 0, 0.3)
 
+  -- A multiline EditBox's hit area covers only the text it is currently drawing, so a
+  -- click in the empty space below a short template lands on nothing and the box reads
+  -- as dead. This sits under the editbox across the whole visible box and hands focus
+  -- over; clicks that DO land on the text hit the editbox above and place the cursor.
+  local editClick = CreateFrame("Frame", nil, canvas)
+  editClick:SetPoint("TOPLEFT", 8, -325)
+  editClick:SetSize(504, 64)
+  editClick:EnableMouse(true)
+
   local editbox = CreateFrame("EditBox", nil, canvas)
+  editbox:SetFrameLevel(editClick:GetFrameLevel() + 1)
   editbox:SetPoint("TOPLEFT", 12, -329)
   editbox:SetSize(496, 56)
   editbox:SetMultiLine(true)
   editbox:SetAutoFocus(false)
   editbox:SetFontObject("ChatFontNormal")
-  -- Cap typed chars (AUD-014; WHISPER_MAX_TEMPLATE_CHARS): {link} counts as its 6
-  -- literal chars; the send-time backstop in popup.lua handles the real rendered
-  -- length against the 255-byte cap.
-  editbox:SetMaxLetters(LIF.WHISPER_MAX_TEMPLATE_CHARS)
+  -- The typed-character cap is enforced in OnTextChanged via TruncateTypedChars, not
+  -- by SetMaxLetters (AUD-517): it is undocumented whether SetMaxLetters counts the
+  -- typed form or the escaped one GetText returns, and if it counts the escaped form a
+  -- pipe-carrying template would stop accepting input before the counter reached the
+  -- cap. Set the client cap to twice our limit — the escaped form is at most double the
+  -- typed length (every typed "|" stores as "||") — so it can never bite first and our
+  -- rule always governs. {link} counts as its 6 literal chars (AUD-014); the send-time
+  -- backstop handles the real rendered length against the 255-byte limit.
+  editbox:SetMaxLetters(LIF.WHISPER_MAX_TEMPLATE_CHARS * 2)
+  editClick:SetScript("OnMouseDown", function() editbox:SetFocus() end)
   editbox:SetScript("OnEscapePressed", EditBox_ClearFocus)
+  -- Enter COMMITS the template, it does not insert a newline (AUD-504). SetMultiLine
+  -- is kept for word-wrap display only; a whisper is a single line. RenderWhisperBody
+  -- collapses any newline that reaches the template by another route.
+  editbox:SetScript("OnEnterPressed", EditBox_ClearFocus)
 
   -- Live length counter under the box: typed chars plus an estimate of the full sent
   -- byte length (prefix + rendered {link}), using the example link the preview uses.
@@ -228,17 +261,12 @@ local function buildCanvas()
   local maxBytes = LIF.WHISPER_MAX_BYTES
   local function updatePreview(t)
     t = t or ""
-    -- Build from the shared prefix so the preview never drifts from what is actually
-    -- sent (AUD-318). WHISPER_PREFIX carries its trailing space, so it sits inside the
-    -- grey color span — cosmetically identical.
-    preview:SetText("|cffaaaaaa" .. LIF.WHISPER_PREFIX .. "|r" .. t:gsub("{link}", LIF.EXAMPLE_ITEM_LINK))
-    -- Count CODEPOINTS, not bytes, to match SetMaxLetters (which caps characters):
-    -- every non-continuation byte (outside 0x80-0xBF) begins one codepoint.
-    -- GetText() escapes each typed "|" as "||", so collapse those first or the count
-    -- runs ahead of the cap the user is actually typing against. The byte estimate
-    -- below deliberately keeps the escaped form — that IS what gets sent.
-    local displayed = t:gsub("||", "|")
-    local typed = select(2, displayed:gsub("[^\128-\191]", ""))
+    -- Render through the shared substituter so the preview can never drift from what
+    -- is actually sent (AUD-318/AUD-506). WHISPER_PREFIX carries its trailing space,
+    -- so it sits inside the grey color span — cosmetically identical.
+    preview:SetText("|cffaaaaaa" .. LIF.WHISPER_PREFIX .. "|r" .. LIF.RenderWhisperBody(t, LIF.EXAMPLE_ITEM_LINK))
+    -- The byte estimate deliberately keeps the escaped form — that IS what gets sent.
+    local typed = LIF.CountTypedChars(t)
     local sent = #LIF.RenderWhisperMessage(t, LIF.EXAMPLE_ITEM_LINK)
     local sentColor = (sent > maxBytes) and "ffff4040" or "ff808080"
     counter:SetText(string.format("%d / %d typed   |c%s~%d / %d when sent|r",
@@ -246,7 +274,16 @@ local function buildCanvas()
   end
 
   editbox:SetScript("OnTextChanged", function(self)
-    updatePreview(self:GetText())
+    local text = self:GetText()
+    -- Enforce the typed-character cap ourselves (AUD-517). SetText re-enters this
+    -- handler once, and the second pass is a no-op because the text is already at the
+    -- cap — so this settles immediately rather than looping.
+    local capped = LIF.TruncateTypedChars(text, LIF.WHISPER_MAX_TEMPLATE_CHARS)
+    if capped ~= text then
+      self:SetText(capped)
+      return
+    end
+    updatePreview(text)
   end)
   editbox:SetScript("OnEditFocusLost", function(self)
     -- Trim so a whitespace-only template persists as "" and hits the empty-template
@@ -282,9 +319,7 @@ local function buildCanvas()
   btnReset:SetSize(140, 22)
   btnReset:SetText("Reset Position")
   btnReset:SetScript("OnClick", function()
-    if LootItForward.db then
-      LootItForward.db.char.popupPosition = nil
-    end
+    LootItForward.db.char.popupPosition = nil
     if LIF.Popup_RestorePosition then LIF.Popup_RestorePosition() end
   end)
 
@@ -298,8 +333,11 @@ local function buildCanvas()
   canvas:SetScript("OnShow", function()
     -- Deref .profile live on every show, not once at build time, so an AceDB profile
     -- swap can't leave the panel bound to an orphaned table (AUD-325).
-    local db = LootItForward.db and LootItForward.db.profile
-    if not db then return end
+    -- LuaLS types AceDB:New() as possibly-nil and cannot see the file invariant above, so
+    -- it wants a nil check on every field read. The annotation states the invariant instead
+    -- of re-adding a runtime guard for a state that cannot occur (AUD-526).
+    ---@type table
+    local db = LootItForward.db.profile
     -- Coerce a stale/unknown saved sound key (e.g. a pre-M9 key no longer in the
     -- list) to the default, so the dropdown label matches the sound that actually
     -- plays instead of self-healing only when the user re-picks (AUD-016). "NONE"
@@ -325,16 +363,14 @@ function LIF.InitSettings()
   Settings.RegisterAddOnCategory(category)
   LIF._settingsCategoryID = category:GetID()
 
-  -- Captured once and handed to the registry (AUD-325). This assumes the profile
-  -- table is never swapped: AceDB profile switching replaces LootItForward.db.profile,
-  -- which would leave these bindings reading the orphaned old table. Safe today — the
-  -- addon ships no profile UI and the canvas widgets deref .profile live — but if
-  -- profiles ever land, re-derive these on an OnProfileChanged callback.
-  local db = LootItForward.db.profile
-  Settings.RegisterAddOnSetting(category, "LootItForward_enableOpenWorld",        "enableOpenWorld",        db, type(true), "Enable in open world groups", true)
-  Settings.RegisterAddOnSetting(category, "LootItForward_showChatNotifications",  "showChatNotifications",  db, type(true), "Show chat notifications",     true)
-  Settings.RegisterAddOnSetting(category, "LootItForward_minPartySize",           "minPartySize",           db, type(0),    "Minimum party size",          2)
-  Settings.RegisterAddOnSetting(category, "LootItForward_popupSound",             "popupSound",             db, type(""),   "Sound on popup",              DEFAULT_SOUND_KEY)
+  -- No Settings.RegisterAddOnSetting calls here, deliberately. A CANVAS category has no
+  -- layout initializers, so options search cannot index its settings and Blizzard renders
+  -- no Defaults button for it — both confirmed in-game 2026-07-12. Registering the five
+  -- settings bought nothing: nothing outside this canvas can write them, so the registry
+  -- objects and their SetValueChangedCallbacks were unreachable. The widget handlers in
+  -- buildCanvas are the only write path, and they already re-run GROUP_ROSTER_UPDATE and
+  -- refresh the popup's Whisper buttons themselves. Search/Defaults would need a VERTICAL
+  -- layout category, which is a panel rewrite, not a registration.
 
   C_Item.RequestLoadItemDataByID(LIF.EXAMPLE_ITEM_ID)
 end

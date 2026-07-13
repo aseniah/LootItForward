@@ -1,33 +1,42 @@
 local _, LIF = ...
 
 -- ============================================================
--- equipLoc → numeric slot ID list (matches LIF.SLOT_IDS in queue.lua)
+-- The equipLoc vocabulary — ONE table, so a new equipLoc cannot be half-added.
+--   slots = numeric inventory slot IDs (matches LIF.SLOT_IDS in queue.lua)
+--   hand  = short label for the verbose drop header; present exactly on the
+--           weapon/off-hand equipLocs (those occupying slot 16 and/or 17), absent
+--           on armor/neck/back/ring/trinket so the header omits "hand=" for them.
+-- The hand label used to be a second table keyed by the same vocabulary and had
+-- already drifted (INVTYPE_OFFHAND was missing from it — AUD-523). A drift-guard in
+-- test_spec_data asserts hand is present iff the equipLoc touches slot 16/17.
 -- ============================================================
-local EQUIP_LOC_SLOTS = {
-  INVTYPE_HEAD          = {1},
-  INVTYPE_NECK          = {2},
-  INVTYPE_SHOULDER      = {3},
-  INVTYPE_CHEST         = {5},
-  INVTYPE_ROBE          = {5},   -- same slot as INVTYPE_CHEST
-  INVTYPE_WAIST         = {6},
-  INVTYPE_LEGS          = {7},
-  INVTYPE_FEET          = {8},
-  INVTYPE_WRIST         = {9},
-  INVTYPE_HAND          = {10},
-  INVTYPE_FINGER        = {11, 12},
-  INVTYPE_TRINKET       = {13, 14},
-  INVTYPE_BACK          = {15},
-  INVTYPE_CLOAK         = {15},   -- WoW API uses INVTYPE_CLOAK for back items
-  INVTYPE_WEAPON        = {16},
-  INVTYPE_WEAPONMAINHAND = {16},  -- main-hand-only weapons (SpecWeaponHands handles them)
-  INVTYPE_RANGED        = {16},   -- legacy ranged items (bows); MH slot since MoP
-  INVTYPE_RANGEDRIGHT   = {16},   -- bows, guns, crossbows, wands; MH slot since MoP
-  INVTYPE_2HWEAPON      = {16, 17},
-  INVTYPE_WEAPONOFFHAND = {17},
-  INVTYPE_OFFHAND       = {17},
-  INVTYPE_SHIELD        = {17},
-  INVTYPE_HOLDABLE      = {17},
+local EQUIP_LOC = {
+  INVTYPE_HEAD           = { slots = {1} },
+  INVTYPE_NECK           = { slots = {2} },
+  INVTYPE_SHOULDER       = { slots = {3} },
+  INVTYPE_CHEST          = { slots = {5} },
+  INVTYPE_ROBE           = { slots = {5} },        -- same slot as INVTYPE_CHEST
+  INVTYPE_WAIST          = { slots = {6} },
+  INVTYPE_LEGS           = { slots = {7} },
+  INVTYPE_FEET           = { slots = {8} },
+  INVTYPE_WRIST          = { slots = {9} },
+  INVTYPE_HAND           = { slots = {10} },
+  INVTYPE_FINGER         = { slots = {11, 12} },
+  INVTYPE_TRINKET        = { slots = {13, 14} },
+  INVTYPE_BACK           = { slots = {15} },
+  INVTYPE_CLOAK          = { slots = {15} },       -- WoW API uses INVTYPE_CLOAK for back items
+  INVTYPE_WEAPON         = { slots = {16},     hand = "1h" },
+  INVTYPE_WEAPONMAINHAND = { slots = {16},     hand = "mh" },      -- SpecWeaponHands handles these
+  INVTYPE_RANGED         = { slots = {16},     hand = "ranged" },  -- legacy bows; MH slot since MoP
+  INVTYPE_RANGEDRIGHT    = { slots = {16},     hand = "ranged" },  -- bows/guns/crossbows/wands
+  INVTYPE_2HWEAPON       = { slots = {16, 17}, hand = "2h" },
+  INVTYPE_WEAPONOFFHAND  = { slots = {17},     hand = "oh" },
+  INVTYPE_OFFHAND        = { slots = {17},     hand = "oh" },
+  INVTYPE_SHIELD         = { slots = {17},     hand = "shield" },
+  INVTYPE_HOLDABLE       = { slots = {17},     hand = "held" },
 }
+-- Exposed for the AUD-523 drift guard.
+LIF.EQUIP_LOC = EQUIP_LOC
 
 -- Armor subclassID → human-readable type string (locale-safe, spike 011)
 -- Only valid when classID == 4 (Armor). Holdable uses subID=0, shield uses subID=6 — neither is in SUBCLASS_ARMOR (classID=4 only), so they skip this table.
@@ -92,24 +101,12 @@ end
 -- and the player self-check line.
 -- ============================================================
 
--- Dropped weapon/off-hand hand label from equipLoc; nil for non-weapon slots,
--- so the header omits "hand=" for armor/neck/back/ring/trinket.
-local WEAPON_HAND_LABEL = {
-  INVTYPE_2HWEAPON       = "2h",
-  INVTYPE_WEAPON         = "1h",
-  INVTYPE_WEAPONMAINHAND = "mh",
-  INVTYPE_WEAPONOFFHAND  = "oh",
-  INVTYPE_RANGED         = "ranged",
-  INVTYPE_RANGEDRIGHT    = "ranged",
-  INVTYPE_SHIELD         = "shield",
-  INVTYPE_HOLDABLE       = "held",
-}
-
 -- One-line header for a classified drop: name, ilvl, category, weapon hand-type,
 -- the dropped item's primary-stat set, and a wowhead URL (falls back to
 -- id=<itemID> when the link is unavailable).
 function LIF.FormatDropHeader(itemData, itemLink, itemID)
-  local hand = WEAPON_HAND_LABEL[itemData.equipLoc]
+  local e = EQUIP_LOC[itemData.equipLoc]
+  local hand = e and e.hand
   return "item " .. tostring(itemData.name)
     .. " ilvl=" .. tostring(itemData.ilvl)
     .. " cat=" .. tostring(itemData.slotCategory)
@@ -189,7 +186,6 @@ LIF.GetSlotCategory = GetSlotCategory
 --   SpecWeaponUsable(specID, equipLoc, weaponSubID)→ bool (mainHand slot 16, or
 --                                                    offHandWeapon for WEAPONOFFHAND)
 --   SpecOffHandItemUsable(specID, itemSubID)       → bool (shield 6 / holdable 0)
---   SpecIsDualWield(specID)                        → bool (offHandWeapon non-empty)
 -- ============================================================
 local function SpecEntry(specID)
   return specID and LIF.SPEC_TABLE and LIF.SPEC_TABLE[specID] or nil
@@ -234,26 +230,41 @@ local function SpecOffHandItemUsable(specID, itemSubID)
   return (e and e.offHandItem and e.offHandItem[itemSubID] == true) or false
 end
 
-local function SpecIsDualWield(specID)
-  local e = SpecEntry(specID)
-  return (e and e.offHandWeapon and next(e.offHandWeapon) ~= nil) or false
-end
-LIF.SpecIsDualWield = SpecIsDualWield
+-- CanDuplicateIntoOtherHand(specID, slotID, equipLoc, subID) → true | false | nil
+-- D-17 (heirloom duplication). An heirloom can be re-created from the Collections tab as
+-- many times as you like, so a member wearing one in a hand whose type their OTHER hand
+-- also accepts will fill that hand with a scaling copy — no dropped weapon is wanted for
+-- either hand. Whether that is possible is just the equipped item's own type run back
+-- through SpecWeaponHands: the SAME truth table that decides where a DROP can go decides
+-- where a COPY can go.
+--
+-- This is why Outlaw needs no special case. Their off-hand takes daggers and their main
+-- hand does not, so an off-hand heirloom dagger reports "off" — not duplicable into the
+-- main hand — and the main hand stays a real target.
+--
+-- nil = the equipped item's type could not be resolved (cold cache); callers fail closed.
+-- The equipLocs a WEAPON can occupy. subIDs are only meaningful within an item class, and
+-- the off-hand slot also takes armor (classID 4), whose subIDs COLLIDE with weapon ones:
+-- a holdable is 0 (= 1H axe) and a shield is 6 (= polearm). Feeding those into the weapon
+-- truth table makes an heirloom holdable look like a duplicable axe to any spec that lists
+-- axes, which would block every main-hand drop forever. Gate on equipLoc, which is
+-- unambiguous, rather than trusting the subID sets not to overlap.
+local WEAPON_EQUIPLOC = {
+  INVTYPE_WEAPON         = true,
+  INVTYPE_WEAPONMAINHAND = true,
+  INVTYPE_WEAPONOFFHAND  = true,
+  INVTYPE_2HWEAPON       = true,
+}
 
--- ============================================================
--- LIF.GetPlayerPrimaryStat()
--- Two-call pattern: GetSpecialization() → GetSpecializationInfo() → SPEC_TABLE lookup.
--- Returns "STR" | "AGI" | "INT" | nil. Never crashes on missing data.
--- Per D-13: player's own spec — GetSpecialization is accurate, no Hero Talent ambiguity.
--- ============================================================
-local function GetPlayerPrimaryStat()
-  local specIndex = GetSpecialization()
-  if not specIndex or specIndex == 0 then return nil end
-  local specID = GetSpecializationInfo(specIndex)
-  if not specID then return nil end
-  return SpecPrimaryStat(specID)
+local function CanDuplicateIntoOtherHand(specID, slotID, equipLoc, subID)
+  if equipLoc == nil or subID == nil then return nil end
+  if not WEAPON_EQUIPLOC[equipLoc] then return false end   -- a shield/holdable is no one's duplicate
+  local hands = SpecWeaponHands(specID, equipLoc, subID)
+  if not hands then return false end   -- a weapon type this spec cannot wield in either hand
+  if slotID == 16 then return hands == "both" or hands == "off" end
+  return hands == "both" or hands == "main"
 end
-LIF.GetPlayerPrimaryStat = GetPlayerPrimaryStat
+LIF.CanDuplicateIntoOtherHand = CanDuplicateIntoOtherHand
 
 -- ============================================================
 -- LIF.GetItemPrimaryStats(itemLink, equipLoc, classID, subID)
@@ -316,7 +327,8 @@ local function ClassifyItem(itemLink, itemID)
   local slotCategory = GetSlotCategory(equipLoc, classID, subID)
   if slotCategory == "skip" then return nil end
 
-  local slotIDs = EQUIP_LOC_SLOTS[equipLoc]
+  local equipLocEntry = EQUIP_LOC[equipLoc]
+  local slotIDs = equipLocEntry and equipLocEntry.slots
   if slotIDs == nil then
     LIF.Log("classify skip: no slotIDs for equipLoc=" .. tostring(equipLoc))
     return nil
@@ -406,6 +418,45 @@ function LIF.GroupMeetsMinPartySize()
   return groupSize >= minSize
 end
 
+-- ============================================================
+-- LIF.ComputeActive()
+-- The single most consequential boolean in the addon: whether it is alive at all.
+-- A pure predicate over five inputs (IsInRaid, IsInGroup, GroupMeetsMinPartySize,
+-- IsInInstance, enableOpenWorld) with NO side effects — the debug window polls it
+-- every 3 seconds, and every inactive caller path does its own cleanup (REV-013).
+--
+-- Lives here rather than in the entry file so it is truth-table testable offline
+-- (AUD-520), mirroring GroupMeetsMinPartySize above. LootItForward:ShouldBeActive()
+-- is a one-line adapter over it.
+-- ============================================================
+function LIF.ComputeActive()
+  -- Raids are out, instanced and open-world alike (CON-006, DEC-004).
+  if IsInRaid() then return false end
+  if not IsInGroup() then return false end
+  -- Below the configured minimum the addon is fully disabled, not merely
+  -- popup-suppressed (AUD-009). Bidirectional: a join re-activates through
+  -- GROUP_ROSTER_UPDATE, dropping below runs its cleanup branch.
+  if LIF.GroupMeetsMinPartySize and not LIF.GroupMeetsMinPartySize() then return false end
+
+  local openWorldEnabled = (LootItForward and LootItForward.db
+    and LootItForward.db.profile and LootItForward.db.profile.enableOpenWorld) or false
+  local inInstance, instanceType = IsInInstance()
+
+  -- A WoD garrison reports IsInInstance() == true, "party" (confirmed in-game
+  -- 2026-07-12) despite being personal outdoor content, so the dungeon rule below
+  -- would activate the addon while the player idles in their garrison. Treat it as
+  -- the open world it actually is — the same test Blizzard's own UIParent applies.
+  if C_Garrison and C_Garrison.IsOnGarrisonMap and C_Garrison.IsOnGarrisonMap() then
+    return openWorldEnabled
+  end
+
+  -- All 5-player difficulties: normal, heroic, mythic, timewalking (CON-007).
+  if inInstance and instanceType == "party" then return true end
+  if not inInstance and openWorldEnabled then return true end
+  -- arena, pvp, raid instance, scenario, neighborhood, interior -> inactive
+  return false
+end
+
 -- Opens the popup for `entry` once ALL scans have resolved and ≥1 candidate is confirmed.
 -- Called after every scan resolve and from the adaptive scanning-window timer.
 local function _tryOpenPopup(entry)
@@ -456,18 +507,31 @@ local WINDOW_PER_CANDIDATE = 3   -- seconds added per candidate still scanning
 -- ============================================================
 -- Bag scanning utilities
 --
--- LIF.FindItemInBags(itemID)    → bag, slot | nil, nil
---   First slot containing itemID; no tooltip check.
---   Used by TRADE_CLOSED to confirm the item left bags.
+-- Two axes: match by itemID alone, or by an active BIND_TRADE_TIME_REMAINING tooltip
+-- line. Both exist because a BoE/BoU is tradeable with NO timer, so a timer-only search
+-- cannot see it, while an itemID-only search cannot tell our fresh drop from a copy we
+-- already owned.
 --
--- LIF.FindTradeableSlot(itemID) → bag, slot | nil, nil
---   First slot with an active BIND_TRADE_TIME_REMAINING line.
---   Scans ALL matching slots — the fresh drop may sit behind an
---   existing owned copy (no timer) in an earlier slot.
---   Used by TRADE_SHOW to pick up the correct copy for trading.
+-- LIF.FindItemInBags(itemID)          → bag, slot | nil, nil
+--   First slot holding itemID; no tooltip check. Used by the loot pipeline to tell a
+--   not-yet-arrived drop from an untradeable one, and by TRADE_SHOW to locate an
+--   untimed copy that FindTradeableSlot cannot match.
 --
--- LIF.IsItemTradeable(itemID)   → bool
---   Loot-pipeline gate; wraps FindTradeableSlot with policy logs.
+-- LIF.CountItemInBags(itemID)         → number
+--   Same match, counted. TRADE_CLOSED compares against a pre-trade baseline: for an
+--   untimed item a DECREASE is the only proof the trade actually happened.
+--
+-- LIF.FindTradeableSlot(itemID)       → bag, slot | nil, nil
+--   First slot with an active trade timer. Scans ALL matching slots — the fresh drop
+--   may sit behind an already-owned, untimed copy in an earlier slot.
+--
+-- LIF.CountTradeableSlots(itemID)     → number
+--   Same match, counted; the timered counterpart of the TRADE_CLOSED baseline check.
+--
+-- LIF.IsItemTradeable(itemLink, itemID) → bool
+--   The loot-pipeline gate. Settles most items on bind type alone (account-bound, quest,
+--   and warbound-until-equipped are rejected; BoE/unbound clears without a tooltip scan);
+--   only BoP falls through to FindTradeableSlot, whose timer IS the trade window.
 -- ============================================================
 local _scanTooltip
 
@@ -557,6 +621,9 @@ function LIF.FindTradeableSlot(itemID)
           local lines = {}
           for _, region in ipairs({tip:GetRegions()}) do
             if region:GetObjectType() == "FontString" then
+              -- GetRegions() is typed as Region; GetText lives on FontString. The runtime
+              -- check above IS the narrowing, which LuaLS cannot follow on its own.
+              ---@cast region FontString
               local lineText = region:GetText()
               if lineText then
                 lines[#lines + 1] = lineText
@@ -581,6 +648,12 @@ function LIF.FindTradeableSlot(itemID)
     LIF.Log("trade-scan: anchor=«" .. anchor .. "» BIND_TRADE_TIME_REMAINING=«"
       .. tostring(BIND_TRADE_TIME_REMAINING) .. "»")
     for _, d in ipairs(diag) do
+      -- The COUNT is logged separately from the lines: a tooltip that has not
+      -- populated yet yields ZERO lines, which would otherwise print nothing at all
+      -- and read identically to "scanned fine, just no timer" (AUD-508). If a real
+      -- skip ever shows lines=0 here, the tooltip is lagging the container entry and
+      -- the retry budget should cover this case too, not just "not in bags yet".
+      LIF.Log("trade-scan bag" .. d.bag .. " slot" .. d.slot .. " lines=" .. #d.lines)
       for i, l in ipairs(d.lines) do
         LIF.Log("trade-scan bag" .. d.bag .. " slot" .. d.slot .. " line[" .. i .. "]: " .. l:sub(1, 120))
       end
@@ -613,6 +686,7 @@ function LIF.CountTradeableSlots(itemID)
         tip:SetBagItem(bag, slot)
         for _, region in ipairs({tip:GetRegions()}) do
           if region:GetObjectType() == "FontString" then
+            ---@cast region FontString
             local lineText = region:GetText()
             if lineText and lineText:find(anchor, 1, true) then
               count = count + 1
@@ -802,6 +876,17 @@ function LIF.OnPlayerLootReceived(itemLink, itemID, opts)
       LIF.Log("loot skip: local player has no active spec")
       return
     end
+    -- Having SOME spec ID is not enough: it must be one SPEC_TABLE can actually
+    -- evaluate. A spec Blizzard shipped before this addon learned it passes the guard
+    -- above and then fails every stat/weapon self-check closed — which for the LOCAL
+    -- player inverts into "not an upgrade for me → offer it away". Default an
+    -- unevaluable spec to KEEPING the drop (AUD-502). This is not hypothetical: it is
+    -- how Devourer (1480) arrived in Midnight.
+    if not SpecPrimaryStat(playerSpecID) then
+      LIF.Log("loot skip: local player spec " .. tostring(playerSpecID)
+        .. " unknown to SPEC_TABLE — assuming the drop is an upgrade for the player")
+      return
+    end
   end
 
   -- Step 2: self-upgrade check (D-13).
@@ -848,8 +933,14 @@ function LIF.OnPlayerLootReceived(itemLink, itemID, opts)
         C_Timer.After(TRADE_RETRY_DELAY, function() confirmTradeableAndProceed(attempt + 1) end)
         return
       end
+      -- Record which attempt gave up. "no trade timer found" at attempt 0 means the
+      -- item WAS in bags on the very first check, so the retry budget was never spent
+      -- — the hypothesis (AUD-508) is that the container entry can land before the
+      -- tooltip's trade-timer line populates, permanently skipping a tradeable drop.
+      -- The trade-scan lines=N dump above says which it was. Logging only for now.
       local reason = stillArriving and "never appeared in bags" or "no trade timer found"
-      LIF.Log("loot skip: " .. tostring(itemData.name) .. " — not tradeable (" .. reason .. ")")
+      LIF.Log("loot skip: " .. tostring(itemData.name) .. " — not tradeable (" .. reason
+        .. ", attempt=" .. attempt .. "/" .. TRADE_RETRY_MAX .. ")")
       return
     end
 
@@ -1159,6 +1250,28 @@ local function EvaluateItemForCharacter(itemData, threshold, char)
   local cat         = itemData.slotCategory
   local droppedIlvl = itemData.ilvl
 
+  -- Fail closed on an UNRESOLVED equipped ilvl (MEMBERS ONLY — AUD-530). An empty slot
+  -- reads 0 and that is correct; a slot holding an item whose ilvl never resolved reads 0
+  -- too, and 0 makes almost any drop clear `dropped - current >= threshold` — a member
+  -- offered an item that is not an upgrade. Skip them instead; the next inspect fixes it.
+  --
+  -- Gate on exactly the slots the decision reads (decisionSlots is the same list the
+  -- branches and the decision log use), and only where the ilvl actually matters: an
+  -- active heirloom wins on its link alone and never needs one.
+  --
+  -- The local player is exempt: their gear is read live, not from the inspect cache, and
+  -- skipping THEM inverts the premise into "not my upgrade → offer it away". A char with
+  -- no such predicate (the player) has no inspect-cache uncertainty to gate on.
+  if not char.isPlayer and char.isSlotIlvlUnresolved then
+    for _, slot in ipairs(decisionSlots(cat, itemData)) do
+      local slotID, label = slot[1], slot[2]
+      if char.isSlotIlvlUnresolved(slotID)
+         and not isHeirloomActive(char.getSlotLink(slotID), char.level) then
+        return false, nil, slotID, "ilvl unresolved (" .. label .. ")"
+      end
+    end
+  end
+
   if cat == "armor" then
     -- Armor-type filter: the dropped item's type must match this character's
     -- class (moot for the player's own currently-equipped gear, but not for
@@ -1259,64 +1372,62 @@ local function EvaluateItemForCharacter(itemData, threshold, char)
     local dualSlotCompare = (hands == "both")
     local mhHeirloomActive = isHeirloomActive(char.getLiveSlotLink(16), char.level)
     local ohHeirloomActive = isHeirloomActive(char.getLiveSlotLink(17), char.level)
-    if dualSlotCompare then
-      -- An active heirloom in ONE hand doesn't block the drop when the OTHER hand
-      -- holds a beatable non-heirloom weapon — the drop can replace that (M3).
-      -- Skip only when neither hand is a beatable target:
-      --  * both hands hold active heirlooms, OR
-      --  * one hand holds an active heirloom and the other is EMPTY. This is the
-      --    "heirlooms always win" invariant (see M2) applied to a slot that is
-      --    ABOUT to hold a heirloom rather than one that already does: while
-      --    leveling, an empty hand beside an active heirloom gets filled with a
-      --    duplicate heirloom (free to create from the collection, and scaling),
-      --    not a random drop. Comparing the drop against that empty hand (ilvl 0)
-      --    is therefore a false positive.
-      --
-      -- Applies UNIFORMLY — do NOT gate on isPlayer or 2H (AUD-001/AUD-004,
-      -- working-as-intended):
-      --  * dualSlotCompare is reached only by Titan's-Grip 2H (Fury) or an
-      --    either-hand 1H dual-wielder; both can make a second copy of the
-      --    equipped heirloom, so the rule holds for 1H and 2H alike. A 1H+off-hand
-      --    setup (e.g. a mage's weapon + frill) is NOT dualSlotCompare and never
-      --    reaches this branch.
-      --  * For the local PLAYER, EvaluateItemForCharacter returning false means
-      --    "not my upgrade → offer to the party", which is CORRECT here: the player
-      --    fills the empty hand with a duplicate heirloom, not this drop — the
-      --    empty-hand fill is NOT a 0→N self-upgrade (AUD-001/AUD-004).
-      -- This reads only links/heirloom state, never equipLoc, so it is immune to
-      -- the M1 cold-cache is2HEquipped gap.
-      local ohEmpty = char.getLiveSlotLink(17) == nil
-      local mhEmpty = char.getLiveSlotLink(16) == nil
-      if (mhHeirloomActive and ohHeirloomActive)
-         or (mhHeirloomActive and ohEmpty)
-         or (ohHeirloomActive and mhEmpty) then
+    -- ---- Heirloom policy for the weapon slots (D-17) ----
+    -- An active heirloom scales with the member all the way to 69, so it is never worth
+    -- replacing. Two rules decide whether one blocks this drop; both apply UNIFORMLY,
+    -- including to the local player — there, a false return means "not my upgrade → offer
+    -- it to the party", which is exactly right: the player keeps the heirloom (AUD-001/004).
+    --
+    -- H1 DISPLACEMENT — the drop would push an active heirloom out of a slot.
+    --   A 2H takes BOTH hands, so it displaces a heirloom in either one — EXCEPT for
+    --   Titan's Grip (dualSlotCompare), where a 2H occupies just one hand like any other
+    --   weapon, and so can land in the hand the heirloom is not in. A 1H displaces only the
+    --   hand it lands in, and a drop usable in either hand can always land in the other one.
+    if mhHeirloomActive or ohHeirloomActive then
+      if itemData.equipLoc == "INVTYPE_2HWEAPON" and not dualSlotCompare then
         return false, nil, 16, "heirloom"
       end
-    elseif isHeirloomActive(char.getLiveSlotLink(weaponSlot), char.level) then
-      -- Single-slot weapon: an active heirloom in the target slot is unbeatable.
-      return false, nil, weaponSlot, "heirloom"
-    elseif weaponSlot == 17 and mhHeirloomActive and char.getLiveSlotLink(17) == nil then
-      -- Off-hand-only drop (an Outlaw dagger: the main hand can't hold it) into an
-      -- EMPTY off-hand beside an active MAIN-hand heirloom. Same duplicate-heirloom
-      -- rule as the dual path (AUD-001/M2): the empty hand fills with a scaling
-      -- heirloom copy, not this drop, so comparing vs the ilvl-0 empty slot is a
-      -- false positive.
-      return false, nil, 17, "heirloom"
+      if mhHeirloomActive and ohHeirloomActive then
+        return false, nil, 16, "heirloom"
+      end
+      if hands == "main" and mhHeirloomActive then return false, nil, 16, "heirloom" end
+      if hands == "off"  and ohHeirloomActive then return false, nil, 17, "heirloom" end
+
+      -- H2 DUPLICATION — one hand holds an active heirloom, and the member could equip a
+      -- COPY of it in the other hand (Collections re-creates heirlooms freely). Then the
+      -- other hand is not a real target either: it will hold a scaling duplicate, not this
+      -- drop. Both hands are heirloom-locked, so no weapon drop is wanted.
+      --
+      -- Where a copy CANNOT go there (an Outlaw's off-hand dagger — their main hand takes
+      -- no daggers), the other hand stays a genuine target and the drop falls through to
+      -- the normal compare against it.
+      local hlSlot = mhHeirloomActive and 16 or 17
+      local canDup = CanDuplicateIntoOtherHand(char.specID, hlSlot,
+        char.getSlotEquipLoc(hlSlot), char.getSlotSubID(hlSlot))
+      if canDup == nil then
+        -- The equipped heirloom's own type is unresolved (cold cache), so we cannot tell
+        -- whether the other hand is a real target. Fail closed, like the sibling guards.
+        return false, nil, hlSlot, "heirloom type unresolved"
+      end
+      if canDup then
+        return false, nil, hlSlot, "heirloom"
+      end
+      -- H3: the heirloom does not block. ResolveWeaponCompareSlot judges the drop against
+      -- the non-heirloom hand.
     end
     -- Cross-config (D-16): a 2H that REPLACES a current 1H+off-hand setup is
     -- judged against the AVERAGE of the two slots it displaces. Self-gating —
-    -- only fires when an off-hand is actually equipped (slot 17 > 0) and the
-    -- member isn't already on a 2H, i.e. exactly the 1H+off-hand config; a
-    -- pure-2H spec (Arms) never has an off-hand to average. Fury's Titan's-Grip
-    -- 2H is the dual-slot (min) case above, not this one.
+    -- only fires when an off-hand is actually equipped and the member isn't already on a
+    -- 2H, i.e. exactly the 1H+off-hand config; a pure-2H spec (Arms) never has an off-hand
+    -- to average. Fury's Titan's-Grip 2H is the dual-slot (min) case above, not this one.
+    --
+    -- Occupancy is a LINK question, not an ilvl one: an unresolved ilvl reads back as 0 and
+    -- an `ilvl > 0` test would silently skip this branch for a member whose off-hand is
+    -- merely cold, judging the 2H against the bare main hand instead. Both hands are known
+    -- to be heirloom-free (H1 skips every 2H drop beside an active heirloom) and resolved
+    -- (the AUD-530 gate), so pairAvg only ever averages real, known item levels.
     if itemData.equipLoc == "INVTYPE_2HWEAPON" and not dualSlotCompare
-       and not char.is2HEquipped() and char.getLiveSlotIlvl(17) > 0 then
-      -- Heirlooms win (M2): a 2H displaces BOTH hands, so an active heirloom in
-      -- the off-hand it forces off is an unbeatable item the member would lose —
-      -- not a real upgrade. Skip rather than average the heirloom's low scaling
-      -- ilvl into the basis (which drags it down and false-positives). A heirloom
-      -- MAIN hand is already caught by the single-slot gate above (weaponSlot 16).
-      if ohHeirloomActive then return false, nil, 16, "heirloom" end
+       and not char.is2HEquipped() and char.getLiveSlotLink(17) ~= nil then
       local pairAvg = math.floor((char.getLiveSlotIlvl(16) + char.getLiveSlotIlvl(17)) / 2)
       if (droppedIlvl - pairAvg) < threshold then return false, pairAvg, 16, "ilvl" end
       return true, pairAvg, 16, "eligible"
@@ -1342,10 +1453,13 @@ local function EvaluateItemForCharacter(itemData, threshold, char)
         return false, nil, nil, "main-hand type unresolved"
       end
       if char.is2HEquipped() then
-        -- A heirloom main-hand is already caught above: the dualSlotCompare heirloom
-        -- gate (mhHeirloomActive + ohEmpty → "heirloom") for the dual case, and the
-        -- weaponSlot==17 heirloom gate for the hands=="off" case. So the 2H here is
-        -- a beatable non-heirloom weapon.
+        -- H1 displacement, from the EQUIPPED side (D-17): a 2H already fills both hands, so
+        -- taking this drop forces it off — even though the drop itself is a one-hander and
+        -- lands in a hand the heirloom does not occupy. H1 above reasons about where the
+        -- DROP can go and cannot see this; without the guard the drop is compared straight
+        -- against the heirloom's low scaling ilvl and wins (a leveling Windwalker with a
+        -- heirloom staff is the common case). Mirrors the same guard in the offhand branch.
+        if mhHeirloomActive then return false, nil, 16, "heirloom" end
         local twoHandIlvl = char.getLiveSlotIlvl(16)
         if (droppedIlvl - twoHandIlvl) < threshold then return false, twoHandIlvl, 16, "ilvl" end
         return true, twoHandIlvl, 16, "eligible"
@@ -1445,12 +1559,17 @@ function LIF.IsPlayerUpgrade(itemData, threshold)
     getSlotLink     = playerLive,
     getLiveSlotIlvl = readPlayerSlotIlvl,
     getLiveSlotLink = playerLive,
-    -- The player's own equipped gear is reliably client-cached, so a live
-    -- equipLoc read is trustworthy (unlike a party member's — see M1).
+    -- The player's own equipped gear is reliably client-cached, so live equipLoc/subID
+    -- reads are trustworthy (unlike a party member's — see M1).
     getSlotEquipLoc = function(slot)
       local link = GetInventoryItemLink("player", slot)
       if not link then return nil end
       return select(9, GetItemInfo(link))
+    end,
+    getSlotSubID    = function(slot)
+      local link = GetInventoryItemLink("player", slot)
+      if not link then return nil end
+      return select(13, GetItemInfo(link))
     end,
     is2HEquipped    = function() return Is2HWeaponEquipped("player") end,
   }
@@ -1490,15 +1609,50 @@ local function _checkMemberEligibility(itemData, member, unit, threshold)
   local whisperTarget = (_wn and _wr and _wr ~= "") and (_wn .. "-" .. _wr) or UnitName(unit)
   local cmpName = UnitName(unit) or unit
 
+  -- A member on a spec SPEC_TABLE cannot evaluate is skipped outright (AUD-502). The
+  -- stat gate does NOT cover this: StatGateStatus returns "ok" for a STATLESS drop, so
+  -- a statless neck/cloak/ring would bypass every spec check and be offered to a member
+  -- we have no truth table for. Skipping is the safe direction on the member side — the
+  -- cost is a missed candidate, never a wrong offer. (specID 0 is the "spec lost"
+  -- normalization from AUD-013 and lands here too.)
+  if member.specID and not SpecPrimaryStat(member.specID) then
+    local reason = "spec unknown to SPEC_TABLE (" .. tostring(member.specID) .. ")"
+    LIF.Log("cmp " .. cmpName .. " → skip: " .. reason)
+    return false, nil, reason
+  end
+
   -- All slots read from the inspect cache (member.gear), refreshed by the
   -- loot-time reinspect. A party member has no live gear source distinct from
   -- the inspect: GetInventoryItemLink(unit) is inspect data, released by
   -- ClearInspectPlayer before this resolve runs, so a live read here comes back
   -- nil (→ ilvl 0). Weapons/off-hands therefore read the cache like every other
   -- slot; the getLiveSlot* accessors collapse onto it for a member.
-  local function cachedIlvl(slot)
+  -- Three distinct states, which the cache shape already tells apart (queue.lua stores an
+  -- entry ONLY for a slot that holds an item):
+  --   no entry              → the slot is EMPTY. 0 is the truth: anything is an upgrade.
+  --   entry with an ilvl    → that ilvl.
+  --   entry, link, nil ilvl → the item was cold in the client cache when we inspected.
+  --                           Retry off the cached link — it may have loaded since — and
+  --                           if it still will not resolve the ilvl is UNKNOWN (nil).
+  -- Collapsing that last state to 0 is AUD-530: every branch compares
+  -- `dropped - current >= threshold`, so an unknown slot clears almost any threshold and
+  -- we offer a member an item that is not an upgrade. The eval gate skips on nil instead.
+  local function resolvedIlvl(slot)
     local g = member.gear and member.gear[slot]
-    return g and g.ilvl or 0
+    if not g then return 0 end
+    if g.ilvl then return g.ilvl end
+    if not g.link then return 0 end
+    local _, _, _, itemIlvl = GetItemInfo(g.link)
+    return itemIlvl or C_Item.GetDetailedItemLevelInfo(g.link)   -- still nil if cold
+  end
+  -- Every comparison site needs a number, and the gate above them rejects the unknown
+  -- case first, so this stays arithmetic-safe: a nil here would be `nil - 200` inside a
+  -- loot event handler.
+  local function cachedIlvl(slot)
+    return resolvedIlvl(slot) or 0
+  end
+  local function ilvlUnresolved(slot)
+    return resolvedIlvl(slot) == nil
   end
   local function cachedLink(slot)
     local g = member.gear and member.gear[slot]
@@ -1513,15 +1667,28 @@ local function _checkMemberEligibility(itemData, member, unit, threshold)
     local g = member.gear and member.gear[slot]
     return g and g.equipLoc
   end
+  -- The equipped item's weapon/armor subclass, cached at inspect time for the same reason
+  -- as equipLoc. The heirloom duplication rule (D-17) runs it back through SpecWeaponHands
+  -- to ask whether a COPY of this heirloom could go in the member's other hand. nil when it
+  -- could not be resolved even at inspect time; the weapon branch fails closed on that.
+  local function cachedSubID(slot)
+    local g = member.gear and member.gear[slot]
+    return g and g.subID
+  end
   local memberChar = {
     classToken = classToken,
     specID     = member.specID,
+    -- AUD-510 intentional: UnitLevel stays valid for an OFFLINE member (confirmed
+    -- in-game 2026-07-12 — an offline party1 still reported 86), so the heirloom gate
+    -- never sees a 0 here and the cached member.lvl is not needed as a fallback.
     level      = UnitLevel(unit),
     getSlotIlvl     = cachedIlvl,
     getSlotLink     = cachedLink,
     getLiveSlotIlvl = cachedIlvl,
     getLiveSlotLink = cachedLink,
     getSlotEquipLoc = cachedEquipLoc,
+    getSlotSubID    = cachedSubID,
+    isSlotIlvlUnresolved = ilvlUnresolved,
     is2HEquipped    = function()
       return cachedEquipLoc(16) == "INVTYPE_2HWEAPON"
     end,
@@ -1549,7 +1716,9 @@ local function _checkMemberEligibility(itemData, member, unit, threshold)
   return true, {
     guid          = member.guid,
     unit          = unit,
-    name          = UnitName(unit),
+    -- Degrade to the unit token, as the cmp log above already does: _emitLootChatNotif
+    -- concatenates this, so a nil would hard-error inside an event handler (AUD-522).
+    name          = UnitName(unit) or unit,
     whisperTarget = whisperTarget,
     class         = classToken,
     ilvl_current  = ilvlCurrent,

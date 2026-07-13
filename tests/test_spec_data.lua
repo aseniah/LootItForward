@@ -283,6 +283,204 @@ function TestSpecTableConsistency:test_class_keyed_tables_cover_same_classes()
 end
 
 -- ============================================================
+-- TestSpecTableProperties (AUD-519)
+-- The suite double-entry-locks primaryStat, but nothing independently locked the
+-- CONTENTS of mainHand / offHandWeapon / offHandItem — the cells where one wrong
+-- entry silently mis-verdicts a spec forever. Deleting [7] from Mage 62's mainHand,
+-- or adding shield [6] to Enhancement 263, used to pass every test.
+--
+-- These are RELATIONAL invariants, not a mirrored copy of the table: they assert
+-- rules the data must obey ("no two-hander in an off-hand"), so they do not rot the
+-- way a second copy of the same numbers would.
+--
+-- Weapon subIDs: 0 1HAxe · 1 2HAxe · 2 Bow · 3 Gun · 4 1HMace · 5 2HMace ·
+--   6 Polearm · 7 1HSword · 8 2HSword · 9 Warglaive · 10 Staff · 13 Fist ·
+--   15 Dagger · 18 Crossbow · 19 Wand.  Off-hand item subIDs: 0 Holdable · 6 Shield.
+-- ============================================================
+TestSpecTableProperties = {}
+
+-- Set helpers, kept with the tests (never in production).
+local function keysOf(t)
+  local out = {}
+  for k in pairs(t or {}) do out[#out + 1] = k end
+  table.sort(out)
+  return out
+end
+local function setOf(list)
+  local s = {}
+  for _, v in ipairs(list) do s[v] = true end
+  return s
+end
+local function specIDsWhere(pred)
+  local out = {}
+  for specID, e in pairs(LIF.SPEC_TABLE) do
+    if pred(specID, e) then out[#out + 1] = specID end
+  end
+  table.sort(out)
+  return out
+end
+
+-- Two documented exceptions, named here so a reader sees them without opening the data.
+local OUTLAW = 260          -- off-hand accepts any 1H incl. dagger; main-hand excludes dagger
+local FURY   = 72           -- Titan's Grip: two-handers in BOTH hands
+local TITANS_GRIP_SET = { [1] = true, [5] = true, [6] = true, [8] = true }
+
+-- SubIDs that can never sit in an off-hand: two-handers and ranged weapons.
+local TWO_HAND_OR_RANGED = setOf({ 1, 2, 3, 5, 6, 8, 10, 18, 19 })
+
+function TestSpecTableProperties:test_offhand_weapons_are_a_subset_of_main_hand()
+  for specID, e in pairs(LIF.SPEC_TABLE) do
+    if specID ~= OUTLAW then
+      for subID in pairs(e.offHandWeapon) do
+        lu.assertTrue(e.mainHand[subID],
+          ("spec %d lists weapon subID %d off-hand but not main-hand"):format(specID, subID))
+      end
+    end
+  end
+  -- Outlaw is the documented exception: dagger off-hand only.
+  lu.assertTrue(LIF.SPEC_TABLE[OUTLAW].offHandWeapon[15], "Outlaw off-hand accepts daggers")
+  lu.assertNil(LIF.SPEC_TABLE[OUTLAW].mainHand[15], "Outlaw main-hand excludes daggers")
+end
+
+function TestSpecTableProperties:test_no_two_hander_or_ranged_in_an_off_hand()
+  for specID, e in pairs(LIF.SPEC_TABLE) do
+    if specID ~= FURY then
+      for subID in pairs(e.offHandWeapon) do
+        lu.assertNil(TWO_HAND_OR_RANGED[subID],
+          ("spec %d lists 2H/ranged subID %d in offHandWeapon"):format(specID, subID))
+      end
+    end
+  end
+  -- Fury is the documented exception (Titan's Grip), and its set is exact.
+  lu.assertEquals(keysOf(LIF.SPEC_TABLE[FURY].offHandWeapon), keysOf(TITANS_GRIP_SET),
+    "Fury's Titan's-Grip off-hand set must be exactly {1,5,6,8}")
+end
+
+function TestSpecTableProperties:test_every_spec_can_wield_something()
+  for specID, e in pairs(LIF.SPEC_TABLE) do
+    lu.assertNotNil(next(e.mainHand),
+      ("spec %d has an empty mainHand — it could never be a weapon candidate"):format(specID))
+  end
+end
+
+function TestSpecTableProperties:test_dual_wield_specs_are_exactly_these()
+  local dualWielders = specIDsWhere(function(_, e) return next(e.offHandWeapon) ~= nil end)
+  lu.assertEquals(dualWielders,
+    { 72, 251, 255, 259, 260, 261, 263, 268, 269, 577, 581, 1480 },
+    "the set of dual-wielding specs changed")
+end
+
+function TestSpecTableProperties:test_shield_only_for_shield_specs()
+  local shieldSpecs = specIDsWhere(function(_, e) return e.offHandItem[6] end)
+  lu.assertEquals(shieldSpecs, { 65, 66, 73, 262, 264 },
+    "only Prot Warrior, Holy/Prot Paladin and Ele/Resto Shaman use shields")
+end
+
+function TestSpecTableProperties:test_holdable_only_for_caster_specs()
+  local holdableSpecs = specIDsWhere(function(_, e) return e.offHandItem[0] end)
+  lu.assertEquals(#holdableSpecs, 18, "18 caster/healer specs can hold an off-hand item")
+  -- Ele/Resto Shaman keep holdables (see docs: SHAMAN=true is correct, not a bug).
+  lu.assertTrue(LIF.SPEC_TABLE[262].offHandItem[0], "Elemental Shaman can hold a holdable")
+  lu.assertTrue(LIF.SPEC_TABLE[264].offHandItem[0], "Restoration Shaman can hold a holdable")
+end
+
+function TestSpecTableProperties:test_wand_only_for_priest_mage_warlock()
+  local wandSpecs = specIDsWhere(function(_, e) return e.mainHand[19] end)
+  lu.assertEquals(wandSpecs, { 62, 63, 64, 256, 257, 258, 265, 266, 267 },
+    "wands belong to the nine Priest/Mage/Warlock specs")
+end
+
+function TestSpecTableProperties:test_warglaive_only_for_demon_hunters()
+  local glaiveSpecs = specIDsWhere(function(_, e) return e.mainHand[9] end)
+  lu.assertEquals(glaiveSpecs, { 577, 581, 1480 }, "warglaives are Demon Hunter only")
+end
+
+function TestSpecTableProperties:test_ranged_weapons_only_for_bm_and_mm_hunters()
+  local rangedSpecs = specIDsWhere(function(_, e)
+    return e.mainHand[2] or e.mainHand[3] or e.mainHand[18]
+  end)
+  lu.assertEquals(rangedSpecs, { 253, 254 },
+    "bow/gun/crossbow belong to Beast Mastery and Marksmanship only")
+end
+
+function TestSpecTableProperties:test_within_class_groups_share_identical_sets()
+  -- Specs of one class that are mechanically identical for loot purposes must not drift
+  -- apart: a fix applied to one and missed on its siblings is the failure this catches.
+  local groups = {
+    { name = "Priest",  ids = { 256, 257, 258 } },
+    { name = "Mage",    ids = { 62, 63, 64 } },
+    { name = "Warlock", ids = { 265, 266, 267 } },
+    { name = "Evoker",  ids = { 1467, 1468, 1473 } },
+    { name = "Hunter ranged", ids = { 253, 254 } },
+    { name = "Monk melee",    ids = { 268, 269 } },
+  }
+  for _, g in ipairs(groups) do
+    local first = LIF.SPEC_TABLE[g.ids[1]]
+    for i = 2, #g.ids do
+      local e = LIF.SPEC_TABLE[g.ids[i]]
+      lu.assertEquals(keysOf(e.mainHand), keysOf(first.mainHand),
+        ("%s specs must share one mainHand set (%d drifted)"):format(g.name, g.ids[i]))
+      lu.assertEquals(keysOf(e.offHandWeapon), keysOf(first.offHandWeapon),
+        ("%s specs must share one offHandWeapon set (%d drifted)"):format(g.name, g.ids[i]))
+      lu.assertEquals(keysOf(e.offHandItem), keysOf(first.offHandItem),
+        ("%s specs must share one offHandItem set (%d drifted)"):format(g.name, g.ids[i]))
+      lu.assertEquals(e.primaryStat, first.primaryStat,
+        ("%s specs must share one primaryStat (%d drifted)"):format(g.name, g.ids[i]))
+    end
+  end
+end
+
+-- ============================================================
+-- TestEquipLocVocabulary (AUD-523)
+-- The equipLoc vocabulary is now ONE table (LIF.EQUIP_LOC): slots + an optional
+-- hand label. It used to be two tables keyed by the same names, and they had already
+-- drifted — INVTYPE_OFFHAND was a real, classified off-hand equipLoc but was missing
+-- from the label table, so such a drop logged no hand= tag while its INVTYPE_HOLDABLE
+-- sibling did. These guards make a half-added equipLoc fail loudly.
+-- ============================================================
+TestEquipLocVocabulary = {}
+
+local function touchesHandSlot(slots)
+  for _, s in ipairs(slots) do
+    if s == 16 or s == 17 then return true end
+  end
+  return false
+end
+
+function TestEquipLocVocabulary:test_hand_label_exactly_on_the_weapon_and_offhand_slots()
+  for equipLoc, e in pairs(LIF.EQUIP_LOC) do
+    if touchesHandSlot(e.slots) then
+      lu.assertNotNil(e.hand,
+        ("%s occupies slot 16/17 but has no hand label — the drop header would omit hand=")
+          :format(equipLoc))
+    else
+      lu.assertNil(e.hand,
+        ("%s does not occupy slot 16/17 but carries a hand label"):format(equipLoc))
+    end
+  end
+end
+
+function TestEquipLocVocabulary:test_every_equiploc_has_at_least_one_slot()
+  for equipLoc, e in pairs(LIF.EQUIP_LOC) do
+    lu.assertNotNil(e.slots, ("%s has no slots"):format(equipLoc))
+    lu.assertNotNil(e.slots[1], ("%s has an empty slot list"):format(equipLoc))
+  end
+end
+
+function TestEquipLocVocabulary:test_offhand_category_equiplocs_are_all_present()
+  -- The classifier routes these three to the "offhand" category; each must be in the
+  -- vocabulary with slot 17 and a hand label. INVTYPE_OFFHAND is the one that drifted.
+  for _, equipLoc in ipairs({ "INVTYPE_OFFHAND", "INVTYPE_SHIELD", "INVTYPE_HOLDABLE" }) do
+    local e = LIF.EQUIP_LOC[equipLoc]
+    lu.assertNotNil(e, ("%s missing from the equipLoc vocabulary"):format(equipLoc))
+    lu.assertEquals(e.slots, { 17 }, ("%s must map to slot 17"):format(equipLoc))
+    lu.assertNotNil(e.hand, ("%s must carry a hand label"):format(equipLoc))
+    lu.assertEquals(LIF.GetSlotCategory(equipLoc, 4, 0), "offhand",
+      ("%s must classify as the offhand category"):format(equipLoc))
+  end
+end
+
+-- ============================================================
 -- Run suite
 -- ============================================================
 os.exit(lu.LuaUnit.run())

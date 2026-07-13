@@ -380,6 +380,14 @@ function LIF.OnGroupRosterUpdate()
 end
 
 function LIF.OnInspectReady(guid)
+  -- A nil guid must never reach the identity check below: with nothing in flight
+  -- currentlyInspecting is ALSO nil, so `currentlyInspecting == guid` would be true
+  -- and a nil guid would be treated as our own in-flight target — bypassing the
+  -- foreign-reject, erroring on the log's guid:sub, and releasing the shared inspect
+  -- slot out from under whatever other addon actually owns it. Matches the guards in
+  -- OnUnitHealthChanged / OnUnitDisconnect / OnUnitMaybeScannable and the reassert hook.
+  if guid == nil then return end
+
   -- REQ-inspect-slot-sharing: the inspect slot is shared client-wide, so an
   -- INSPECT_READY can arrive for a member we're NOT currently driving
   -- ourselves — e.g. another addon's mouseover inspect happened to land on
@@ -414,14 +422,16 @@ function LIF.OnInspectReady(guid)
       -- level), so scaling items report the ilvl at the MEMBER's level, not the local player's.
       -- GetDetailedItemLevelInfo applies the local player's context and will over-report ilvl
       -- for scaling items worn by lower-level party members.
-      -- equipLoc is captured from the SAME call and cached per slot so eval-time
-      -- weapon-config checks (is2HEquipped, D-16 off-hand) never re-call
-      -- GetItemInfo live at loot time — which returns nil for an item that has
-      -- since aged out of the local cache, misreading a 2H as not-2H (M1). It
-      -- may still be nil here on a cold cache; consumers fail closed on nil.
-      local _, _, _, itemIlvl, _, _, _, _, equipLoc = GetItemInfo(link)
+      -- equipLoc and subID are captured from the SAME call and cached per slot so eval-time
+      -- weapon-config checks never re-call GetItemInfo live at loot time — which returns nil
+      -- for an item that has since aged out of the local cache, misreading a 2H as not-2H
+      -- (M1). subID is the weapon/armor subclass, which the heirloom duplication rule needs:
+      -- "could this member equip a COPY of that heirloom in their other hand?" is a
+      -- SPEC_TABLE lookup of the EQUIPPED item's subID (D-17). Either may still be nil here
+      -- on a cold cache; consumers fail closed on nil.
+      local _, _, _, itemIlvl, _, _, _, _, equipLoc, _, _, _, subID = GetItemInfo(link)
       local actualIlvl = itemIlvl or C_Item.GetDetailedItemLevelInfo(link)
-      gearData[slotID] = { link = link, ilvl = actualIlvl, equipLoc = equipLoc }
+      gearData[slotID] = { link = link, ilvl = actualIlvl, equipLoc = equipLoc, subID = subID }
     end
   end
 
@@ -453,13 +463,10 @@ function LIF.OnInspectReady(guid)
   if member then
     local now = GetTime()
     if slotCount ~= member.lastSlotCount then
-      member.lastSlotCount = slotCount
-      member.consistentCount = 1
-      member.lastCountedTime = now
+      LIF.Cache.SetScanProgress(guid, slotCount, 1, now)
     elseif slotCount >= MIN_SLOTS
         or (now - (member.lastCountedTime or 0)) >= MIN_HARVEST_SPACING then
-      member.consistentCount = (member.consistentCount or 0) + 1
-      member.lastCountedTime = now
+      LIF.Cache.SetScanProgress(guid, member.lastSlotCount, (member.consistentCount or 0) + 1, now)
     end
   end
 
@@ -505,11 +512,7 @@ function LIF.OnInspectReady(guid)
   end
 
   -- Reset stabilization tracking on COMPLETE.
-  if member then
-    member.lastSlotCount = nil
-    member.consistentCount = nil
-    member.lastCountedTime = nil
-  end
+  LIF.Cache.ClearScanProgress(guid)
 
   local playerLevel = UnitLevel(unit) or "?"
   local inspectIlvl = C_PaperDollInfo.GetInspectItemLevel(unit)
@@ -601,13 +604,9 @@ function LIF.RequestReinspect(guid)
   local member = LIF.Cache.GetMember(guid)
   if not member then return end  -- member left group
 
-  -- Retain member.gear as the fallback snapshot; only flip state to PENDING.
-  member.state = "PENDING"
-
-  -- Reset stabilization counters so next set of INSPECT_READY fires counts fresh.
-  member.lastSlotCount  = nil
-  member.consistentCount = nil
-  member.lastCountedTime = nil
+  -- Retains member.gear as the fallback snapshot and resets the stabilization
+  -- counters, so the next run of INSPECT_READY fires counts fresh (AUD-524).
+  LIF.Cache.SetPending(guid)
 
   -- REV-016: rapid multi-drop loot calls RequestReinspect repeatedly for the
   -- same members — remove any existing entry so the guid is moved to the

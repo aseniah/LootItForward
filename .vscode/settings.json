@@ -1,13 +1,17 @@
 {
-  // Managed by the ketho.wow-api extension: on activation it strips any stale
-  // ketho.wow-api entry and re-adds the current version's path, so the pinned version
-  // here self-heals on update. Point at Annotations (the parent), NOT Annotations/Core —
-  // Core alone omits FrameXML, which is where Settings, SlashCmdList, DEFAULT_CHAT_FRAME
-  // and EditBox_ClearFocus are declared.
-  //
-  // Everything else lives in .luarc.json (editor-agnostic, and it takes precedence over
-  // these settings anyway — a second copy here would only drift).
-  "Lua.workspace.library": [
-    "~/.vscode/extensions/ketho.wow-api-0.22.3/Annotations"
-  ]
+  // Send the ketho.wow-api extension's LuaLS writes to your USER settings instead of this file.
+  // On every activation the extension rewrites Lua.runtime.version, Lua.runtime.builtin and
+  // Lua.workspace.library into whichever scope this names — and it always writes the library as
+  // Annotations/Core, which drops the FrameXML tree. At "Workspace" that means a tracked file
+  // that churns on every editor start and disagrees with .luarc.json. At "User" the extension
+  // deletes those keys from this file and never touches it again. .luarc.json supplies all
+  // three settings and overrides the editor anyway, so nothing is lost.
+  "wowAPI.luals.configurationScope": "User",
+
+  // MUST stay false. When true (the default) the extension appends every WoW global it knows to
+  // Lua.diagnostics.globals — hardcoded to WORKSPACE scope, so the setting above cannot redirect
+  // it. Suppressing undefined-global throws away the only signal that a WoW API has been REMOVED;
+  // an undefined global is nil at runtime, not an error. A ~45-name list grown this way hid the
+  // removed GetItemStats for months.
+  "wowAPI.luals.defineKnownGlobals": false
 }

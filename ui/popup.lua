@@ -33,7 +33,9 @@ local _removeSection
 local _recalcFrameHeight
 
 -- pendingTrade: set by [Trade] button OnClick; consumed by TRADE_SHOW handler.
--- Shape: { itemLink = string, unit = string, t = GetTime() } or nil.
+-- Shape: { itemLink = string, guid = string, name = string, t = GetTime() } or nil.
+-- The partner is identified by GUID, not a unit token: tokens reassign on a roster
+-- change and this record outlives one (AUD-505). name is for logging only.
 -- TTL guard (REV-007): InitiateTrade can fail silently (target out of trade
 -- range, dead, busy, declined) and TRADE_SHOW never fires — without an expiry
 -- a later unrelated trade window (even one another player opens with us)
@@ -41,11 +43,10 @@ local _recalcFrameHeight
 local pendingTrade = nil
 local PENDING_TRADE_TTL = 5  -- seconds; TRADE_SHOW from our InitiateTrade arrives well within this
 
--- Bag-cache-lag retry budget for TRADE_CLOSED's "did the item leave bags" check.
--- Same WoW client behavior as core/loot.lua's confirmTradeableAndProceed (dfec109):
--- the bag cache can still report a just-traded item as present for longer than
--- one 0.3s check during a busy moment. Retry until the item disappears
--- (completed) or the budget is exhausted (genuinely cancelled).
+-- Bag-cache-lag retry budget for TRADE_CLOSED's "did the item leave bags" check. During a
+-- busy moment the bag cache can still report a just-traded item as present for longer than
+-- a single 0.3s check, so retry until it disappears (completed) or the budget runs out
+-- (genuinely cancelled). core/loot.lua's confirmTradeableAndProceed retries the same lag.
 local TRADE_CLOSED_RETRY_DELAY = 0.3
 local TRADE_CLOSED_RETRY_MAX   = 5
 
@@ -76,23 +77,18 @@ local tradedItemTimered = nil
 -- buttons check this flag and early-return in example mode (D-19).
 LIF.examplePopupActive = false
 
--- Whisper prefix, prepended to every outgoing whisper (AUD-014). Counts toward the
--- 255-byte SendChatMessage limit. Exported so ui/settings.lua's length counter and
--- the send-time backstop below share one source of truth (popup.lua loads first).
-LIF.WHISPER_PREFIX = "[Loot It Forward] "
-LIF.WHISPER_MAX_BYTES = 255
-local WHISPER_MAX_BYTES = LIF.WHISPER_MAX_BYTES
--- Max characters the settings whisper-template editbox accepts. Exported so the
--- settings hint, SetMaxLetters, and length counter share one source of truth (AUD-318).
-LIF.WHISPER_MAX_TEMPLATE_CHARS = 100
--- Default whisper template. Single source of truth (AUD-408): the AceDB `defaults`
--- table in LootItForward.lua (which loads after popup.lua per TOC) and the send-time
--- fallback both reference this, rather than repeating the literal.
-LIF.DEFAULT_WHISPER_TEMPLATE = "Hey, {link} dropped for me and I don't need it. Do you want it?"
+-- Whisper constants and composition live in core/whisper.lua (loaded first per TOC),
+-- where the harness can reach them (AUD-506).
 
 -- ============================================================
 -- Dismiss (module-local so the Dismiss button OnClick can reference it)
 -- ============================================================
+
+-- True between the drag handle's OnMouseDown and OnMouseUp — i.e. while the user is
+-- physically dragging the popup. ShowPopup must not re-anchor the frame out from under
+-- a live drag (AUD-514), and dismissPopup uses it to know whether its
+-- StopMovingOrSizing is actually cancelling a drag.
+local isMoving = false
 
 local function dismissPopup()
   -- Nothing to dismiss (frame never created, or already hidden with no sections):
@@ -104,9 +100,12 @@ local function dismissPopup()
   -- If an event-driven dismiss (roster prune, TRADE_CLOSED cascade, PEW location
   -- change) lands mid-drag, OnMouseUp never fires on the hidden frame, so the frame
   -- would stay in the moving state and stick to the cursor on the next Show. Stop the
-  -- move here (harmless when not moving). Deliberately do NOT save the dragged
-  -- position — a dismiss is not a deliberate placement (AUD-307).
-  frame:StopMovingOrSizing()
+  -- move here. Deliberately do NOT save the dragged position — a dismiss is not a
+  -- deliberate placement (AUD-307).
+  if isMoving then
+    frame:StopMovingOrSizing()
+    isMoving = false
+  end
   -- Tear down all section frames
   for itemLink, _ in pairs(itemSections) do
     _removeSection(itemLink)
@@ -147,14 +146,7 @@ function LIF.Popup_Dismiss()
 end
 
 local function _saveDraggedPosition()
-  local xOfs = frame:GetLeft() - UIParent:GetLeft()
-  local yOfs = frame:GetTop() - UIParent:GetBottom()
-  frame:ClearAllPoints()
-  frame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", xOfs, yOfs)
-  if LootItForward and LootItForward.db then
-    LootItForward.db.char.popupPosition = { x = xOfs, y = yOfs }
-    LIF.Log("popup: position saved x=" .. xOfs .. " y=" .. yOfs)
-  end
+  LIF.SaveDraggedPosition(frame, "popupPosition", "popup")
 end
 
 -- ============================================================
@@ -181,19 +173,26 @@ tradeEventFrame:SetScript("OnEvent", function(self, event)
     end
 
     local targetLink = pendingTrade.itemLink
-    local targetUnit = pendingTrade.unit
+    local targetGuid = pendingTrade.guid
+    local targetName = pendingTrade.name
     pendingTrade = nil   -- clear before any early returns to avoid stale state
 
     -- Verify the trade partner is who we opened the trade with (AUD-003). The TTL
     -- above only rejects LATE trades; within it, a DIFFERENT player opening a trade
     -- with us (common post-boss, when loot is passed around) would otherwise get our
     -- item auto-placed into their trade. During an open trade the "npc" unit token is
-    -- the partner. Block only on a POSITIVE mismatch: if the token is unresolvable we
-    -- fall through to the prior behaviour (no regression). UnitIsUnit is used only in
-    -- the condition, never string-embedded (cf. secret-boolean pitfall).
-    if targetUnit and UnitExists("npc") and not UnitIsUnit("npc", targetUnit) then
+    -- the partner.
+    --
+    -- Compare GUIDs, not unit tokens (AUD-505): party tokens REASSIGN when someone
+    -- leaves (party3 becomes party2), so a token captured at click time can name a
+    -- different member by the time this fires up to PENDING_TRADE_TTL seconds later —
+    -- which is exactly the post-boss window this guard defends. A GUID is stable.
+    -- Block only on a POSITIVE mismatch: if the partner's GUID is unresolvable we fall
+    -- through to the prior behaviour (no regression).
+    local partnerGuid = UnitExists("npc") and UnitGUID("npc") or nil
+    if targetGuid and partnerGuid and partnerGuid ~= targetGuid then
       LIF.Log("popup: TRADE_SHOW partner mismatch (trade opened with "
-        .. tostring(UnitName("npc")) .. ", expected " .. tostring(UnitName(targetUnit))
+        .. tostring(UnitName("npc")) .. ", expected " .. tostring(targetName)
         .. ") — not auto-populating")
       return
     end
@@ -231,9 +230,10 @@ tradeEventFrame:SetScript("OnEvent", function(self, event)
     ClearCursor()
     tradedItemLink = targetLink   -- save so TRADE_CLOSED can detect success
     -- Name from the actual partner ("npc") when resolvable (authoritative, and now
-    -- verified to match the intended unit above); fall back to the intended unit.
-    tradeRecipient = (UnitExists("npc") and UnitName("npc"))
-      or (targetUnit and UnitName(targetUnit)) or "?"
+    -- verified to match the intended member above); else the name captured at click
+    -- time, which — unlike a re-resolved unit token — cannot have drifted to someone
+    -- else on a roster change (AUD-505).
+    tradeRecipient = (UnitExists("npc") and UnitName("npc")) or targetName or "?"
     LIF.Log("popup: auto-populated trade slot 1 with " .. tostring(targetLink))
     LIF.Log("Trade window opened — offering " .. tostring(targetLink) .. " to " .. tostring(tradeRecipient), "info")
 
@@ -271,7 +271,11 @@ tradeEventFrame:SetScript("OnEvent", function(self, event)
     local dupCase = (baseline or 0) >= 2
     local function checkTradeResult(attempt)
       C_Timer.After(TRADE_CLOSED_RETRY_DELAY, function()
-        if itemSections[link] ~= sectionRef then return end   -- section torn down or replaced by a same-link re-drop (AUD-405)
+        -- The section must still be ALIVE and the SAME one (AUD-405/AUD-515). A
+        -- nil sectionRef means a roster prune already removed it between the click
+        -- and TRADE_CLOSED, and `nil ~= nil` is false — so a key-identity-only guard
+        -- read "unchanged" and let the retry run against a section that is gone.
+        if sectionRef == nil or itemSections[link] ~= sectionRef then return end
         local completed
         if not timered then
           completed = LIF.CountItemInBags(itemID) < baseline
@@ -305,60 +309,35 @@ tradeEventFrame:SetScript("OnEvent", function(self, event)
   end
 end)
 
--- Default popup position for characters with no saved position yet (or a
--- corrupted/off-screen save) — centered on screen. The old fixed (0, 400)
--- default pinned the popup to the far bottom-left corner, which a first-time
--- character could easily miss entirely (2026-07-03).
-local function _defaultPopupPosition(frameHeight)
-  local w = UIParent:GetWidth() or 1024
-  local h = UIParent:GetHeight() or 768
-  local x = (w - FRAME_WIDTH) / 2
-  local y = (h + (frameHeight or FRAME_MIN_HEIGHT)) / 2
-  return x, y
-end
-
--- A saved position is only usable if BOTH coords are real numbers and y is
--- positive (TOPLEFT anchors to UIParent BOTTOMLEFT, so y<=0 is off-screen). A
--- partially-corrupt save such as { y = 400 } with x missing would otherwise
--- pass a y-only guard and then throw on SetPoint(nil x) / the position concat.
-local function _hasSavedPosition(pos)
-  return pos and type(pos.x) == "number" and type(pos.y) == "number" and pos.y > 0
-end
-
--- Is a saved (x, y) actually on the CURRENT screen? The anchor is the frame's
--- TOPLEFT against UIParent's BOTTOMLEFT, so x is the left edge and y is the top
--- edge's height above the bottom. Require the title bar to stay grabbable: enough
--- horizontal overlap, and the title strip fully within the vertical extent. A
--- position saved at a larger resolution (or after a UI-scale change) can land
--- off-screen; this catches that so the popup is re-centered instead of lost.
-local MIN_ONSCREEN = 40  -- px of the frame that must remain visible
-local function _isOnScreen(x, y)
-  local w = UIParent:GetWidth() or 1024
-  local h = UIParent:GetHeight() or 768
-  local visibleW = math.min(x + FRAME_WIDTH, w) - math.max(x, 0)
-  -- Positive-form comparisons so a NaN coord (which fails every ordered compare)
-  -- is treated as off-screen rather than slipping through a `< / >` negation.
-  if not (visibleW >= MIN_ONSCREEN) then return false end
-  if not (y <= h and y >= TITLE_BAR_HEIGHT) then return false end
-  return true
-end
+-- Geometry the shared position rules (core/frame_position.lua) judge this window by.
+local POPUP_GEOM = { width = FRAME_WIDTH, titleStrip = TITLE_BAR_HEIGHT }
 
 -- Resolve the position to open at: the saved one if it is valid AND on-screen,
--- otherwise the centered default. A corrupt or off-screen save is CLEARED so the
--- popup stays centered on later shows rather than being re-detected every time
--- (AUD-018 — mirrors what /lif resetpos does, but automatically).
-local function _resolvePopupPosition()
+-- otherwise centered — including for a character that has never moved the popup, so a
+-- first-time popup opens where it will be seen. A corrupt or off-screen save is CLEARED
+-- so the popup stays centered on later shows rather than being re-detected every time
+-- (AUD-018 — what /lif resetpos does, but automatically).
+--
+-- frameHeight is the CONTENT height of the frame as it will be shown. Any caller that
+-- has already sized the frame must pass it, or the fallback centres against
+-- FRAME_MIN_HEIGHT and the popup opens low (AUD-513).
+local function _resolvePopupPosition(frameHeight)
+  local w = UIParent:GetWidth() or 1024
+  local h = UIParent:GetHeight() or 768
   local pos = LootItForward and LootItForward.db and LootItForward.db.char.popupPosition
-  if _hasSavedPosition(pos) and _isOnScreen(pos.x, pos.y) then
-    return pos.x, pos.y
+
+  local verdict, x, y = LIF.ResolveSavedPosition(pos, POPUP_GEOM, w, h)
+  if verdict == "saved" then
+    return x, y
   end
-  if pos and LootItForward and LootItForward.db then
+
+  if verdict ~= "none" and LootItForward and LootItForward.db then
     LootItForward.db.char.popupPosition = nil
-    LIF.Log(_hasSavedPosition(pos)
+    LIF.Log(verdict == "offscreen"
       and "popup: saved position off-screen — re-centering"
       or "popup: ignoring corrupt saved position — re-centering")
   end
-  return _defaultPopupPosition()
+  return LIF.CenteredPosition(FRAME_WIDTH, frameHeight or FRAME_MIN_HEIGHT, w, h)
 end
 
 -- ============================================================
@@ -404,10 +383,14 @@ local function createPopupFrame()
   dragHandle:SetHeight(TITLE_BAR_HEIGHT)
   dragHandle:EnableMouse(true)
   dragHandle:SetScript("OnMouseDown", function(self, button)
-    if button == "LeftButton" then f:StartMoving() end
+    if button == "LeftButton" then
+      isMoving = true
+      f:StartMoving()
+    end
   end)
   dragHandle:SetScript("OnMouseUp", function(self, button)
     if button == "LeftButton" then
+      isMoving = false
       f:StopMovingOrSizing()
       _saveDraggedPosition()
     end
@@ -667,38 +650,6 @@ local function _addItemSection(itemData)
 end
 
 -- Renders the full whisper text for a template + item link, including the prefix.
--- Pure string op — no send. gsub replaces EVERY {link} occurrence, so a multi-{link}
--- template is measured exactly (AUD-014). Shared by the send path (real link) and the
--- settings length counter (EXAMPLE_ITEM_LINK) so both measure identical byte lengths.
-function LIF.RenderWhisperMessage(template, link)
-  -- gsub treats % as magic in the REPLACEMENT (%1..%9; a lone %x errors), and a
-  -- localized item name/link is outside our control (the over-length degrade path
-  -- feeds the raw name in by design), so escape % before substituting (AUD-304).
-  -- Assign to a local first: inlining the :gsub would pass its match COUNT as the
-  -- outer gsub's n argument and cap replacements.
-  local replacement = (link or ""):gsub("%%", "%%%%")
-  return LIF.WHISPER_PREFIX .. string.gsub(template or "", "{link}", replacement)
-end
-
--- Reduce WoW color/hyperlink/texture markup to plain text. Used on the whisper
--- over-length degrade path so a byte-truncated message can never end mid-escape
--- (AUD-306): |H..|h / |c..|r sequences are pure ASCII, so the UTF-8 boundary back-up
--- doesn't protect them, and a cut inside one throws "Invalid escape code". Reducing
--- to plain text BEFORE the cut makes truncation safe at any byte. A literal-pipe
--- escape "||" is protected first (swapped to \1) so the strip patterns can't match
--- at its second pipe and mangle a following escape-shaped run into a stray "|"
--- (AUD-407), then restored — "||" is already the correct form to send.
-local function _stripWoWEscapes(s)
-  s = s:gsub("||", "\1")                 -- protect literal-pipe escapes
-  s = s:gsub("|c%x%x%x%x%x%x%x%x", "")   -- color open (|cAARRGGBB)
-  s = s:gsub("|H.-|h(.-)|h", "%1")       -- hyperlink -> its display text
-  s = s:gsub("|T.-|t", "")               -- inline texture
-  s = s:gsub("|A.-|a", "")               -- inline atlas
-  s = s:gsub("|[rhta]", "")              -- stray color/link/texture/atlas closers
-  s = s:gsub("\1", "||")                 -- restore literal-pipe escapes
-  return s
-end
-
 -- Whisper button enable state (AUD-014). A whisper is only valid when the template is
 -- non-empty (an explicitly-cleared "" template renders a useless prefix-only message;
 -- nil never happens — AceDB seeds a default) AND chat is not in messaging lockdown
@@ -829,39 +780,18 @@ local function _addCandidateRow(section, candidateData, itemLink)
     local link = section.itemData.link
     local template = (LootItForward and LootItForward.db and LootItForward.db.profile.whisperMessage)
                      or LIF.DEFAULT_WHISPER_TEMPLATE
-    local msg = LIF.RenderWhisperMessage(template, link)
     -- 255-byte send guard (AUD-014): the client silently truncates an over-length
     -- whisper, and a cut through an item-link escape sequence throws "Invalid escape
-    -- code" and can disconnect. Degrade to the item NAME (plain text) so a long link
-    -- never yields a broken message, and strip any residual markup the template might
-    -- carry so the cut below is escape-safe regardless of how the template was
-    -- populated (AUD-306) — the editbox normally prevents template escapes, but this
-    -- removes the dependency on that.
-    if #msg > WHISPER_MAX_BYTES then
-      local name = (section.itemData and section.itemData.name) or link
-      msg = _stripWoWEscapes(LIF.RenderWhisperMessage(template, name))
-      if #msg > WHISPER_MAX_BYTES then
-        -- Cut on a UTF-8 char boundary, never mid-sequence: SetMaxLetters caps
-        -- CHARACTERS not bytes, and non-ASCII templates / localized item names can
-        -- still overflow. WoW rejects malformed UTF-8. If the byte just past the cut
-        -- is a continuation byte (0x80-0xBF) the cut is mid-character, so back it up
-        -- to the preceding lead byte.
-        local cut = WHISPER_MAX_BYTES
-        while cut > 0 do
-          local b = msg:byte(cut + 1)
-          if b and b >= 0x80 and b <= 0xBF then cut = cut - 1 else break end
-        end
-        msg = msg:sub(1, cut)
-      end
-      LIF.Log("popup: whisper over " .. WHISPER_MAX_BYTES .. " bytes — degraded to item name for " .. target)
+    -- code" and can disconnect. ComposeWhisper degrades to the item NAME and strips
+    -- markup before any cut (core/whisper.lua).
+    local msg, degraded = LIF.ComposeWhisper(template, link, section.itemData and section.itemData.name)
+    if degraded then
+      LIF.Log("popup: whisper over " .. LIF.WHISPER_MAX_BYTES .. " bytes — degraded to item name for " .. target)
     end
-    -- C_ChatInfo.SendChatMessage, not the global SendChatMessage (reverting e89b0cf):
-    -- confirmed live 2026-07-03 that the global's "silently does nothing for WHISPER"
-    -- claim was wrong — C_ChatInfo.SendChatMessage delivers whispers fine. Note this
-    -- does NOT avoid the local "ChatHistory_GetAccessID" taint error some sessions hit
-    -- (confirmed both APIs crash identically when another addon — AccWideUILayoutSelection
-    -- here — has tainted Blizzard's chat-history table); that error is cosmetic and
-    -- doesn't block delivery either way. See docs/wow-api-pitfalls.md.
+    -- C_ChatInfo.SendChatMessage delivers whispers; so does the global SendChatMessage.
+    -- Neither avoids the cosmetic "ChatHistory_GetAccessID" taint error thrown in sessions
+    -- where another addon has tainted Blizzard's chat-history table — it does not block
+    -- delivery. Don't swap this for the global expecting a fix. See docs/wow-api-pitfalls.md.
     C_ChatInfo.SendChatMessage(msg, "WHISPER", nil, target)
     LIF.Log("popup: whisper sent to " .. target)
     LIF.Log("Whispered " .. tostring(target) .. " about " .. tostring(link), "info")
@@ -884,10 +814,19 @@ local function _addCandidateRow(section, candidateData, itemLink)
       LIF.Log("popup: Trade clicked but unit not found for guid=" .. tostring(candidateData.guid))
       return
     end
-    -- InitiateTrade is not blocked by combat lockdown (confirmed in-game 2026-07-03) —
-    -- the trade window opens fine mid-combat, so pendingTrade must always be set or
-    -- TRADE_SHOW fires with no record of what to auto-populate.
-    pendingTrade = { itemLink = itemLink, unit = unit, t = GetTime() }
+    -- InitiateTrade is NOT blocked by combat lockdown: the trade window opens mid-combat,
+    -- so pendingTrade must always be set, or TRADE_SHOW fires with no record of what to
+    -- auto-populate. Do not gate this on InCombatLockdown.
+    --
+    -- Identify the partner by GUID, not by the unit token: the token is only good for
+    -- the InitiateTrade call below, while the TRADE_SHOW guard needs an identity that
+    -- survives a roster reshuffle (AUD-505).
+    pendingTrade = {
+      itemLink = itemLink,
+      guid     = candidateData.guid,
+      name     = candidateData.name,
+      t        = GetTime(),
+    }
     InitiateTrade(unit)
     LIF.Log("popup: InitiateTrade called for " .. tostring(candidateData.name))
   end)
@@ -908,24 +847,12 @@ end
 -- Lazily creates the frame if needed, then applies the saved position.
 function LIF.Popup_RestorePosition()
   if not frame then createPopupFrame() end
+  -- Centre against the frame's CURRENT rendered height, not FRAME_MIN_HEIGHT: a reset
+  -- (button or /lif resetpos) while a content-filled popup is open has to land where the
+  -- next ShowPopup would, or the popup sits low here and jumps up on the following show
+  -- (V-01). At init the frame is still min-height, so this is a no-op there.
+  local x, y = _resolvePopupPosition(frame:GetHeight())
   frame:ClearAllPoints()
-  local pos = LootItForward and LootItForward.db and LootItForward.db.char.popupPosition
-  -- Saved position if valid AND on the current screen (a save from a larger
-  -- resolution that now lands off-screen is dropped below).
-  if _hasSavedPosition(pos) and _isOnScreen(pos.x, pos.y) then
-    frame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", pos.x, pos.y)
-    LIF.Log("popup: position restored x=" .. pos.x .. " y=" .. pos.y)
-    return
-  end
-  -- No usable save: clear a corrupt/off-screen value, then centre on the frame's
-  -- CURRENT rendered height — not FRAME_MIN_HEIGHT. A reset (button or /lif resetpos)
-  -- while a content-filled popup is open must land where the next ShowPopup would, or
-  -- the popup sits low here and jumps up on the following show (V-01). At init the
-  -- frame is still min-height, so this matches the old behaviour there.
-  if pos and LootItForward and LootItForward.db then
-    LootItForward.db.char.popupPosition = nil
-  end
-  local x, y = _defaultPopupPosition(frame:GetHeight())
   frame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", x, y)
   LIF.Log("popup: position restored x=" .. x .. " y=" .. y)
 end
@@ -978,21 +905,25 @@ function LIF.ShowPopup(itemData, candidates)
 
   _recalcFrameHeight()
 
-  -- Re-anchor on every show. With NO saved position, recompute the centered default
-  -- now that the frame has grown to fit its content (not just at OnInitialize, and not
-  -- before _recalcFrameHeight — the frame anchors TOPLEFT and grows downward, so
-  -- centering against FRAME_MIN_HEIGHT before content is added leaves the box off-center
-  -- vertically; 2026-07-03). With a saved position, re-apply it: a mid-drag dismiss
-  -- (AUD-307) freezes the frame at an abandoned, UNSAVED drag point, so without this
-  -- every later popup this session would open there instead of the saved spot (AUD-406).
-  -- Idempotent for a deliberate drag, which is saved on mouse-up.
-  local pos = LootItForward and LootItForward.db and LootItForward.db.char.popupPosition
-  frame:ClearAllPoints()
-  if not _hasSavedPosition(pos) then
-    local x, y = _defaultPopupPosition(frame:GetHeight())
-    frame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", x, y)
-  else
-    local x, y = _resolvePopupPosition()
+  -- Re-anchor on every show, and only AFTER _recalcFrameHeight: the frame anchors TOPLEFT
+  -- and grows downward, so a centre computed before the content is added is off by half the
+  -- content height. Re-applying a SAVED position matters too — a mid-drag dismiss (AUD-307)
+  -- leaves the frame parked at an abandoned, never-saved drag point, and without this every
+  -- later popup this session would open there instead of the saved spot (AUD-406). A
+  -- deliberate drag saves on mouse-up, so re-applying is a no-op for it.
+  --
+  -- NOT while the user is dragging (AUD-514): ShowPopup runs on every eligible drop,
+  -- and a second drop resolving seconds after the first is an ordinary multi-item
+  -- sequence, so it can land mid-drag. ClearAllPoints + SetPoint under a live
+  -- StartMoving() fights the move state, and mouse-up would then persist whatever
+  -- offset that left behind. The drag itself saves the position on mouse-up, so
+  -- skipping the re-anchor here loses nothing.
+  if not isMoving then
+    -- Pass the CONTENT height, not FRAME_MIN_HEIGHT: whenever this centres — no save, or
+    -- a save that turns out to be off-screen — the frame anchors TOPLEFT and grows
+    -- downward, so centring against the minimum height opens the popup low (AUD-513).
+    local x, y = _resolvePopupPosition(frame:GetHeight())
+    frame:ClearAllPoints()
     frame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", x, y)
   end
 

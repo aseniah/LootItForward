@@ -260,6 +260,25 @@ function TestQueue:test_inspect_ready_guid_guard()
 end
 
 -- ------------------------------------------------------------
+-- test_inspect_ready_nil_guid_is_a_noop (AUD-507)
+-- With nothing in flight, currentlyInspecting is nil — so a nil guid made
+-- `currentlyInspecting == guid` true, marking it as our OWN target. That bypassed
+-- the foreign-reject and hard-errored on the guid:sub() in the log line, inside an
+-- event handler. It would also have released the shared inspect slot with nothing
+-- of ours in flight, cancelling another addon's inspect. Every sibling handler
+-- guards this; this one did not.
+-- ------------------------------------------------------------
+function TestQueue:test_inspect_ready_nil_guid_is_a_noop()
+  local ok, err = pcall(LIF.OnInspectReady, nil)
+
+  lu.assertTrue(ok, "a nil guid must not raise: " .. tostring(err))
+  lu.assertEquals(_clearInspectCount, 0,
+    "a nil guid must NOT release the shared inspect slot")
+  lu.assertEquals(#_notifyInspectCalls, 0,
+    "a nil guid must NOT drive a new inspect")
+end
+
+-- ------------------------------------------------------------
 -- test_inspect_ready_completes_member (REQ-scan-queue-sequential)
 -- OnInspectReady for the correct GUID must mark the member COMPLETE.
 -- ------------------------------------------------------------

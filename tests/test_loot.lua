@@ -105,6 +105,10 @@ end
 -- guard doesn't fire. Tests needing a two-hander call equipMember2H (or set
 -- gear[16].equipLoc = "INVTYPE_2HWEAPON" directly).
 local DEFAULT_SLOT_EQUIPLOC = { [16] = "INVTYPE_WEAPON", [17] = "INVTYPE_WEAPONOFFHAND" }
+-- Weapon subclass, cached per slot like equipLoc. Only the heirloom duplication rule
+-- (D-17) reads it, and only for a slot holding an active heirloom — but default it on the
+-- weapon slots so a fixture never looks "type unresolved" by accident. 7 = sword.
+local DEFAULT_SLOT_SUBID = { [16] = 7, [17] = 7 }
 local function mockMemberGear(guid, unit, classToken, specID, gearTable)
   _mockGuids[unit] = guid
   _mockUnitClass[unit] = { classToken, classToken }
@@ -116,7 +120,9 @@ local function mockMemberGear(guid, unit, classToken, specID, gearTable)
     local link = "item:" .. guid .. "s" .. slotID
     _mockGearLinks[unit][slotID] = link
     _mockIlvl[link] = ilvl
-    cacheGear[slotID] = { link = link, ilvl = ilvl, equipLoc = DEFAULT_SLOT_EQUIPLOC[slotID] }
+    cacheGear[slotID] = { link = link, ilvl = ilvl,
+                          equipLoc = DEFAULT_SLOT_EQUIPLOC[slotID],
+                          subID    = DEFAULT_SLOT_SUBID[slotID] }
   end
   LIF.Cache.SetComplete(guid, { gear = cacheGear, specID = specID })
 end
@@ -198,9 +204,8 @@ function TestLoot:test_trinket_ilvl_only_no_stat()
   _mockSpecializationInfo[1] = 259
 
   local itemData = LIF.ClassifyItem(link)
-  callIsPlayerUpgrade(itemData, 10)
-  -- If we reach here, the call did not skip — assert true (ilvl-only: 480-450=30>=10)
-  lu.assertTrue(true, "test_trinket_ilvl_only_no_stat: reached past skip guard")
+  lu.assertTrue(callIsPlayerUpgrade(itemData, 10),
+    "secondary-stat trinket is an ilvl-only self-upgrade (480 - 450 = 30 >= 10)")
 end
 
 -- ============================================================
@@ -220,8 +225,8 @@ function TestLoot:test_self_upgrade_armor_no_popup()
   _mockSpecializationInfo[1] = 259  -- Assassination Rogue (AGI)
 
   local itemData = LIF.ClassifyItem(link)
-  callIsPlayerUpgrade(itemData, 10)
-  lu.assertTrue(true, "test_self_upgrade_armor_no_popup: reached past skip guard")
+  lu.assertTrue(callIsPlayerUpgrade(itemData, 10),
+    "leather chest is a self-upgrade for a Rogue (480 - 460 = 20 >= 10)")
 end
 
 function TestLoot:test_self_upgrade_empty_slot_is_upgrade()
@@ -236,8 +241,8 @@ function TestLoot:test_self_upgrade_empty_slot_is_upgrade()
   _mockSpecializationInfo[1] = 259
 
   local itemData = LIF.ClassifyItem(link)
-  callIsPlayerUpgrade(itemData, 10)
-  lu.assertTrue(true, "test_self_upgrade_empty_slot_is_upgrade: reached past skip guard")
+  lu.assertTrue(callIsPlayerUpgrade(itemData, 10),
+    "any positive-ilvl drop is a self-upgrade over an empty slot (worstIlvl 0)")
 end
 
 function TestLoot:test_request_reinspect_dedups_queue()
@@ -314,8 +319,8 @@ function TestLoot:test_weapon_self_upgrade_stat_match()
   _mockSpecializationInfo[1] = 259  -- Assassination Rogue (AGI)
 
   local itemData = LIF.ClassifyItem(link)
-  callIsPlayerUpgrade(itemData, 10)
-  lu.assertTrue(true, "test_weapon_self_upgrade_stat_match: reached past skip guard")
+  lu.assertTrue(callIsPlayerUpgrade(itemData, 10),
+    "AGI dagger is a self-upgrade for an AGI spec (490 - 470 = 20 >= 10)")
 end
 
 function TestLoot:test_weapon_self_upgrade_stat_mismatch()
@@ -330,8 +335,8 @@ function TestLoot:test_weapon_self_upgrade_stat_mismatch()
   _mockSpecializationInfo[1] = 259  -- Assassination Rogue (AGI)
 
   local itemData = LIF.ClassifyItem(link)
-  callIsPlayerUpgrade(itemData, 10)
-  lu.assertTrue(true, "test_weapon_self_upgrade_stat_mismatch: reached past skip guard")
+  lu.assertFalse(callIsPlayerUpgrade(itemData, 10),
+    "INT staff is NOT a self-upgrade for an AGI spec despite out-ilvling the equipped weapon")
 end
 
 function TestLoot:test_mainhand_only_weapon_classifies_to_slot_16()
@@ -360,8 +365,8 @@ function TestLoot:test_neck_self_upgrade_ilvl_only()
   _mockSpecializationInfo[1] = 259
 
   local itemData = LIF.ClassifyItem(link)
-  callIsPlayerUpgrade(itemData, 10)
-  lu.assertTrue(true, "test_neck_self_upgrade_ilvl_only: reached past skip guard")
+  lu.assertTrue(callIsPlayerUpgrade(itemData, 10),
+    "statless neck is an ilvl-only self-upgrade (480 - 460 = 20 >= 10)")
 end
 
 function TestLoot:test_trinket_self_upgrade_stat_mismatch_not_upgrade()
@@ -380,8 +385,8 @@ function TestLoot:test_trinket_self_upgrade_stat_mismatch_not_upgrade()
   _mockSpecializationInfo[1] = 259  -- Assassination Rogue (AGI) — stat mismatch
 
   local itemData = LIF.ClassifyItem(link)
-  callIsPlayerUpgrade(itemData, 10)
-  lu.assertTrue(true, "test_trinket_self_upgrade_stat_mismatch_not_upgrade: reached past skip guard")
+  lu.assertFalse(callIsPlayerUpgrade(itemData, 10),
+    "INT trinket is NOT a self-upgrade for an AGI spec despite out-ilvling both equipped trinkets")
 end
 
 function TestLoot:test_trinket_self_upgrade_no_primary_stat_ilvl_only()
@@ -401,8 +406,8 @@ function TestLoot:test_trinket_self_upgrade_no_primary_stat_ilvl_only()
   _mockSpecializationInfo[1] = 259
 
   local itemData = LIF.ClassifyItem(link)
-  callIsPlayerUpgrade(itemData, 10)
-  lu.assertTrue(true, "test_trinket_self_upgrade_no_primary_stat_ilvl_only: reached past skip guard")
+  lu.assertTrue(callIsPlayerUpgrade(itemData, 10),
+    "secondary-stat trinket falls back to ring rules and IS a self-upgrade (500 - 450 = 50 >= 10)")
 end
 
 -- ============================================================
@@ -924,6 +929,33 @@ function TestLoot:test_specless_player_drop_ignored()
 
   lu.assertEquals(#LIF.pendingLootItems, 0,
     "A drop must be ignored when the local player has no active spec")
+end
+
+function TestLoot:test_unknown_player_spec_drop_ignored()
+  -- AUD-502: Blizzard ships a new spec, the addon has not learned it yet. The spec
+  -- ID is PRESENT, so the specless guard above passes — but SPEC_TABLE has no entry,
+  -- so every stat/weapon self-check fails closed, which for the LOCAL player inverts
+  -- to "not an upgrade for me → offer it away". The drop is a genuine +50 upgrade
+  -- with a matching stat and must stay with the player: keep it, no pending entry.
+  -- (This is how Devourer/1480 arrived in Midnight.)
+  _mockIsInInstance = { true, "party" }
+  _mockIsInGroup    = true
+
+  local link = "item:unknownspec_trinket"
+  mockItem(link, { "UnknownSpecTrinket", nil, 4, 500, nil, "Armor", "Trinket", nil, "INVTYPE_TRINKET", nil, nil, 4, 0, 0 })
+  _mockItemStats[link] = { ITEM_MOD_AGILITY_SHORT = 200 }
+  _mockGuids["player"] = "GUID-SELF"
+  _mockGearLinks["player"] = { [13] = "item:pt1", [14] = "item:pt2" }
+  _mockIlvl["item:pt1"] = 450
+  _mockIlvl["item:pt2"] = 450
+  _mockGetSpecialization = 1
+  _mockSpecializationInfo[1] = 9999  -- a spec SPEC_TABLE has never heard of
+
+  callOnLoot(link, 55124)
+  FirePendingAfterCallbacks()
+
+  lu.assertEquals(#LIF.pendingLootItems, 0,
+    "A drop must be ignored when the local player's spec is unknown to SPEC_TABLE")
 end
 
 function TestLoot:test_loot_in_combat_defers_reinspect_until_combat_end()
@@ -1953,6 +1985,54 @@ function TestLoot:test_self_check_offhand_stat_mismatch_not_upgrade()
     "INT holdable must not read as a self-upgrade for a STR spec, regardless of ilvl delta")
 end
 
+function TestLoot:test_self_dual_wield_heirloom_locks_both_hands()
+  -- D-17 H2 applies to the LOCAL PLAYER exactly as it does to a member — the rules are not
+  -- gated on isPlayer. Frost DK with an heirloom sword in the main hand and a beatable real
+  -- weapon in the off-hand: they can wield a second scaling copy, so a 1H drop is not a
+  -- self-upgrade. "Not my upgrade" is the RIGHT answer here — it forwards the drop to the
+  -- party while the player keeps the heirloom (AUD-001/AUD-004).
+  _mockUnitClass["player"] = { "Death Knight", "DEATHKNIGHT" }
+  _mockUnitLevel["player"] = 50
+  _mockHeirloomItemIDs[77301] = true
+  mockItem("item:77301", { "Heirloom Sword", nil, 3, 200, nil, "Weapon", "Swords", nil,
+                           "INVTYPE_WEAPON", nil, nil, 2, 7, 1 })
+  _mockGearLinks["player"] = { [16] = "item:77301", [17] = "item:77302" }
+  _mockIlvl["item:77301"] = 200
+  _mockIlvl["item:77302"] = 180
+  _mockGetSpecialization = 1
+  _mockSpecializationInfo[1] = 251   -- Frost DK (dual-wield)
+
+  local itemData = { link = "item:self_dw_sword", ilvl = 250, equipLoc = "INVTYPE_WEAPON",
+                     classID = 2, subID = 7, slotIDs = {16}, slotCategory = "weapon",
+                     weaponSubID = 7 }
+
+  lu.assertFalse(callIsPlayerUpgrade(itemData, 10),
+    "a duplicable heirloom locks both of the player's hands too")
+end
+
+function TestLoot:test_self_outlaw_offhand_heirloom_leaves_the_main_hand_open()
+  -- D-17 H3, self side. An Outlaw cannot main-hand a dagger, so a copy of their off-hand
+  -- heirloom dagger cannot fill the main hand — which stays a real target. A sword that
+  -- beats the main hand IS a self-upgrade, and must not be forwarded to the party.
+  _mockUnitClass["player"] = { "Rogue", "ROGUE" }
+  _mockUnitLevel["player"] = 50
+  _mockHeirloomItemIDs[77303] = true
+  mockItem("item:77303", { "Heirloom Dagger", nil, 3, 200, nil, "Weapon", "Daggers", nil,
+                           "INVTYPE_WEAPON", nil, nil, 2, 15, 1 })
+  _mockGearLinks["player"] = { [16] = "item:77304", [17] = "item:77303" }
+  _mockIlvl["item:77304"] = 180   -- real main-hand weapon
+  _mockIlvl["item:77303"] = 200
+  _mockGetSpecialization = 1
+  _mockSpecializationInfo[1] = 260   -- Outlaw
+
+  local itemData = { link = "item:self_outlaw_sword", ilvl = 250, equipLoc = "INVTYPE_WEAPON",
+                     classID = 2, subID = 7, slotIDs = {16}, slotCategory = "weapon",
+                     weaponSubID = 7 }
+
+  lu.assertTrue(callIsPlayerUpgrade(itemData, 10),
+    "an Outlaw's main hand takes no dagger copies, so it is still a real self-upgrade target")
+end
+
 function TestLoot:test_self_check_offhand_heirloom_equipped_not_upgrade()
   -- Player wears a heirloom holdable in slot 17 at level 50. Must NOT read
   -- as a self-upgrade regardless of ilvl delta.
@@ -2736,18 +2816,16 @@ function TestDualWield:test_offhand_weapon_eligible_for_dw_spec()
   lu.assertEquals(captured[1].ilvl_current, 100)
 end
 
-function TestDualWield:test_member_dw_mainhand_heirloom_compares_offhand()
-  -- Frost DK (dual-wield) with an ACTIVE heirloom in the main hand and a normal
-  -- beatable weapon in the off-hand. An either-hand 1H drop must still be judged
-  -- against the non-heirloom off-hand, not skipped because the MH is a heirloom
-  -- (M3). Skip fully only when BOTH hands hold active heirlooms.
+function TestDualWield:test_member_dw_mainhand_heirloom_skips_both_hands()
+  -- D-17 H2 (duplication). Frost DK (dual-wield) with an ACTIVE heirloom sword in the main
+  -- hand and a beatable normal weapon in the off-hand. Their off-hand takes swords too, so
+  -- they can re-create the heirloom from Collections and wield a second scaling copy —
+  -- neither hand is a real target, and no weapon drop is wanted at all.
   local guid = "Player-0-FrostDKHeir"
   mockMemberGear(guid, "party1", "DEATHKNIGHT", 251, { [16] = 200, [17] = 180 })
   _mockUnitLevel["party1"] = 50
-  -- Override the cached main-hand link with an active 1H heirloom (equipLoc
-  -- resolved, so the M1 fail-closed doesn't treat it as possibly-2H).
   local member = LIF.Cache.GetMember(guid)
-  member.gear[16] = { link = "item:99201", ilvl = 200, equipLoc = "INVTYPE_WEAPON" }
+  member.gear[16] = { link = "item:99201", ilvl = 200, equipLoc = "INVTYPE_WEAPON", subID = 7 }
   _mockHeirloomItemIDs[99201] = true
   _mockGuids["player"] = "GUID-SELF"
 
@@ -2756,12 +2834,8 @@ function TestDualWield:test_member_dw_mainhand_heirloom_compares_offhand()
                      slotCategory = "weapon", slotIDs = {16},
                      weaponSubID = 7 }
 
-  local captured = resolveMemberForItem(guid, itemData)
-  lu.assertNotNil(captured,
-    "MH-heirloom dual-wielder must be judged against the beatable off-hand")
-  lu.assertEquals(captured[1].slotID, 17, "comparison must target the non-heirloom off-hand")
-  lu.assertEquals(captured[1].ilvl_current, 180)
-  lu.assertEquals(captured[1].delta, 20)
+  lu.assertNil(resolveMemberForItem(guid, itemData),
+    "a duplicable heirloom locks BOTH hands — the off-hand will hold a scaling copy")
 end
 
 function TestDualWield:test_member_dw_both_hands_heirloom_skipped()
@@ -2796,11 +2870,13 @@ function TestDualWield:test_member_dw_mainhand_2h_heirloom_blocks_1h_drop()
   mockMemberGear(guid, "party1", "DEATHKNIGHT", 251, { [16] = 200 })  -- OH empty
   _mockUnitLevel["party1"] = 50
   local member = LIF.Cache.GetMember(guid)
-  member.gear[16] = { link = "item:99301", ilvl = 200, equipLoc = "INVTYPE_2HWEAPON" }
+  -- subID resolved (8 = 2H sword), and the drop must OUT-ILVL the heirloom (250 > 200) —
+  -- otherwise the test passes on the plain ilvl compare and never exercises the rule.
+  member.gear[16] = { link = "item:99301", ilvl = 200, equipLoc = "INVTYPE_2HWEAPON", subID = 8 }
   _mockHeirloomItemIDs[99301] = true
   _mockGuids["player"] = "GUID-SELF"
 
-  local itemData = { link = "item:frost_1h", ilvl = 200,
+  local itemData = { link = "item:frost_1h", ilvl = 250,
                      equipLoc = "INVTYPE_WEAPON", classID = 2, subID = 7,
                      slotCategory = "weapon", slotIDs = {16},
                      weaponSubID = 7 }
@@ -2810,15 +2886,16 @@ function TestDualWield:test_member_dw_mainhand_2h_heirloom_blocks_1h_drop()
     "MH 2H heirloom + 1H drop: off-hand not fillable without dropping the heirloom → not a candidate")
 end
 
-function TestDualWield:test_member_titans_grip_2h_heirloom_still_eligible()
-  -- Titan's Grip Fury with a MH 2H heirloom and a beatable 2H in the off-hand:
-  -- a better 2H drop CAN replace the off-hand 2H (TG dual-wields two-handers),
-  -- so it stays eligible — the M3-R1 block must not catch this.
+function TestDualWield:test_member_titans_grip_2h_heirloom_skips_both_hands()
+  -- D-17 H2. Titan's Grip Fury with a 2H heirloom in the main hand and a beatable 2H in the
+  -- off-hand. TG wields two-handers in BOTH hands, so the heirloom is duplicable into the
+  -- off-hand and the 2H drop is not wanted — even though it out-ilvls what is there.
+  -- (H1 does not apply: for TG a 2H occupies one hand, so it displaces nothing.)
   local guid = "Player-0-FuryTG"
   mockMemberGear(guid, "party1", "WARRIOR", 72, { [16] = 200, [17] = 180 })
   _mockUnitLevel["party1"] = 50
   local member = LIF.Cache.GetMember(guid)
-  member.gear[16] = { link = "item:99302", ilvl = 200 }
+  member.gear[16] = { link = "item:99302", ilvl = 200, equipLoc = "INVTYPE_2HWEAPON", subID = 1 }
   mockItem("item:99302", { "Heirloom Greataxe", nil, 3, 200, nil, "Weapon", "Axes", nil, "INVTYPE_2HWEAPON", nil, nil, 2, 1, 1 })
   _mockHeirloomItemIDs[99302] = true
   _mockGuids["player"] = "GUID-SELF"
@@ -2828,10 +2905,8 @@ function TestDualWield:test_member_titans_grip_2h_heirloom_still_eligible()
                      slotCategory = "weapon", slotIDs = {16, 17},
                      weaponSubID = 1 }
 
-  local captured = resolveMemberForItem(guid, itemData)
-  lu.assertNotNil(captured,
-    "Titan's Grip 2H drop beats the off-hand 2H even with a MH heirloom")
-  lu.assertEquals(captured[1].slotID, 17, "compare against the beatable off-hand 2H")
+  lu.assertNil(resolveMemberForItem(guid, itemData),
+    "Fury can wield a second copy of its 2H heirloom — skip")
 end
 
 function TestDualWield:test_member_titans_grip_single_2h_heirloom_empty_oh_skipped()
@@ -2844,7 +2919,7 @@ function TestDualWield:test_member_titans_grip_single_2h_heirloom_empty_oh_skipp
   mockMemberGear(guid, "party1", "WARRIOR", 72, { [16] = 200 })  -- OH empty
   _mockUnitLevel["party1"] = 50
   local member = LIF.Cache.GetMember(guid)
-  member.gear[16] = { link = "item:99304", ilvl = 200, equipLoc = "INVTYPE_2HWEAPON" }
+  member.gear[16] = { link = "item:99304", ilvl = 200, equipLoc = "INVTYPE_2HWEAPON", subID = 1 }
   _mockHeirloomItemIDs[99304] = true
   _mockGuids["player"] = "GUID-SELF"
 
@@ -5478,6 +5553,362 @@ function TestDecisionFormatters:test_self_check_log_enriched()
   lu.assertStrContains(found, "ROGUE")
   lu.assertStrContains(found, "equip=[s5:460")
   lu.assertStrContains(found, "result=")
+end
+
+-- ---------- unknown member spec (AUD-502) ----------
+
+function TestMemberEligibility:test_unknown_member_spec_is_skipped()
+  -- AUD-502, member side. A member on a spec SPEC_TABLE has not learned yet cannot be
+  -- reasoned about, so they must be skipped. The stat gate does NOT catch this on its
+  -- own: StatGateStatus returns "ok" for a STATLESS drop, so a statless neck would sail
+  -- past every spec check and the member would be offered an item we cannot evaluate.
+  local guid = "Player-0-UnknownSpec"
+  mockMemberGear(guid, "party1", "DRUID", 9999, { [2] = 400 })
+  _mockGuids["player"] = "GUID-SELF"
+
+  -- slotCategory "neck", as the real ClassifyItem maps INVTYPE_NECK. Filing it under
+  -- "armor" would route it to the armor branch's CLASS gate and get the member skipped
+  -- for the wrong reason, hiding the statless bypass this test exists to reproduce.
+  local itemData = { link = "item:neck_statless", ilvl = 480, slotID = 2,
+                     equipLoc = "INVTYPE_NECK", slotIDs = {2}, slotCategory = "neck",
+                     itype = "Armor", subtype = "Miscellaneous" }
+  local eligible, cand, reason = checkMember(guid, itemData, 1)
+  lu.assertFalse(eligible, "a member on a spec unknown to SPEC_TABLE must be skipped")
+  lu.assertNil(cand)
+  lu.assertNotNil(reason:find("spec", 1, true), "the skip must say the spec is unknown; got: " .. tostring(reason))
+end
+
+-- ---------- heirloom weapon policy matrix (D-17) ----------
+--
+-- Two rules, in order:
+--   H1 DISPLACEMENT — the drop would push an active heirloom out of a slot → skip.
+--   H2 DUPLICATION  — an active heirloom sits in one hand and SPEC_TABLE says the OTHER
+--                     hand takes that weapon type, so it will hold a scaling copy → skip.
+--   H3 otherwise    — the heirloom blocks nothing; compare against the non-heirloom hand.
+--
+-- Outlaw is the interesting spec and needs no special case: their off-hand takes daggers
+-- and their main hand does not, so an off-hand heirloom dagger is NOT duplicable into the
+-- main hand, and the main hand stays a real target.
+
+-- Give a member an active heirloom in `slot`, with its type resolved.
+local function equipHeirloom(guid, slot, itemID, ilvl, equipLoc, subID)
+  local m = LIF.Cache.GetMember(guid)
+  m.gear[slot] = { link = "item:" .. itemID, ilvl = ilvl, equipLoc = equipLoc, subID = subID }
+  _mockHeirloomItemIDs[itemID] = true
+end
+
+function TestMemberEligibility:test_outlaw_offhand_heirloom_dagger_leaves_the_main_hand_open()
+  -- H3. The heirloom dagger cannot be copied into an Outlaw's main hand, so the main hand
+  -- is still a genuine target: a sword drop that beats it must be offered.
+  local guid = "Player-0-OutlawOHHeir"
+  mockMemberGear(guid, "party1", "ROGUE", 260, { [16] = 180, [17] = 200 })
+  _mockUnitLevel["party1"] = 50
+  equipHeirloom(guid, 17, 88801, 200, "INVTYPE_WEAPON", 15)   -- 15 = dagger
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:outlaw_sword", ilvl = 200, equipLoc = "INVTYPE_WEAPON",
+                     classID = 2, subID = 7, slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 7 }
+  local eligible, cand = checkMember(guid, itemData, 1)
+  lu.assertTrue(eligible, "an Outlaw's main hand takes no daggers, so it is still beatable")
+  lu.assertEquals(cand.slotID, 16, "compare against the non-heirloom main hand")
+  lu.assertEquals(cand.ilvl_current, 180)
+end
+
+function TestMemberEligibility:test_outlaw_offhand_heirloom_dagger_with_empty_main_hand()
+  -- The bug the old blanket rule had: "heirloom in one hand + other hand EMPTY → skip"
+  -- assumed the empty hand gets a duplicate. For Outlaw it cannot, so an empty main hand is
+  -- a real 0-item-level target and any usable main-hand weapon is an upgrade.
+  local guid = "Player-0-OutlawEmptyMH"
+  mockMemberGear(guid, "party1", "ROGUE", 260, { [17] = 200 })   -- main hand EMPTY
+  _mockUnitLevel["party1"] = 50
+  equipHeirloom(guid, 17, 88802, 200, "INVTYPE_WEAPON", 15)
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:outlaw_sword2", ilvl = 150, equipLoc = "INVTYPE_WEAPON",
+                     classID = 2, subID = 7, slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 7 }
+  local eligible, cand = checkMember(guid, itemData, 1)
+  lu.assertTrue(eligible, "an empty main hand an Outlaw cannot fill with a dagger copy is a real target")
+  lu.assertEquals(cand.slotID, 16)
+  lu.assertEquals(cand.ilvl_current, 0)
+end
+
+function TestMemberEligibility:test_outlaw_dagger_drop_into_the_heirloom_offhand_is_blocked()
+  -- H1. A dagger can ONLY go in an Outlaw's off-hand, which is where the heirloom is — so
+  -- taking it would displace the heirloom.
+  local guid = "Player-0-OutlawDaggerDrop"
+  mockMemberGear(guid, "party1", "ROGUE", 260, { [16] = 180, [17] = 200 })
+  _mockUnitLevel["party1"] = 50
+  equipHeirloom(guid, 17, 88803, 200, "INVTYPE_WEAPON", 15)
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:outlaw_dagger", ilvl = 300, equipLoc = "INVTYPE_WEAPON",
+                     classID = 2, subID = 15, slotCategory = "weapon", slotIDs = {17},
+                     weaponSubID = 15 }
+  local eligible, _, reason = checkMember(guid, itemData, 1)
+  lu.assertFalse(eligible, "a dagger can only land where the heirloom already is")
+  lu.assertEquals(reason, "heirloom")
+end
+
+function TestMemberEligibility:test_2h_drop_loses_to_a_heirloom_in_either_hand()
+  -- H1. A 2H takes BOTH hands (Titan's Grip aside), so it displaces a heirloom in either.
+  for _, slot in ipairs({ 16, 17 }) do
+    local guid = "Player-0-2HvsHeirloom" .. slot
+    mockMemberGear(guid, "party1", "SHAMAN", 262, { [16] = 180, [17] = 180 })
+    _mockUnitLevel["party1"] = 50
+    equipHeirloom(guid, slot, 88810 + slot, 180, "INVTYPE_WEAPON", 4)   -- 4 = 1H mace
+    _mockGuids["player"] = "GUID-SELF"
+
+    local itemData = { link = "item:big_staff", ilvl = 400, equipLoc = "INVTYPE_2HWEAPON",
+                       classID = 2, subID = 10, slotCategory = "weapon", slotIDs = {16},
+                       weaponSubID = 10 }
+    local eligible, _, reason = checkMember(guid, itemData, 1)
+    lu.assertFalse(eligible,
+      ("a 2H displaces both hands, so a heirloom in slot %d blocks it"):format(slot))
+    lu.assertEquals(reason, "heirloom")
+  end
+end
+
+function TestMemberEligibility:test_equipped_2h_heirloom_blocks_a_1h_drop()
+  -- H1 from the EQUIPPED side. A leveling Windwalker on a heirloom STAFF with an empty
+  -- off-hand: a 1H drop lands in a hand the heirloom does not occupy, but a 2H fills both
+  -- hands, so taking it forces the heirloom off. Comparing the drop against the heirloom's
+  -- low scaling ilvl (it wins easily) is a false positive.
+  local guid = "Player-0-WWStaffHeir"
+  mockMemberGear(guid, "party1", "MONK", 269, { [16] = 150 })   -- off-hand empty
+  _mockUnitLevel["party1"] = 50
+  equipHeirloom(guid, 16, 88840, 150, "INVTYPE_2HWEAPON", 10)   -- 10 = staff
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:ww_1h", ilvl = 250, equipLoc = "INVTYPE_WEAPON",
+                     classID = 2, subID = 0, slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 0 }
+  local eligible, _, reason = checkMember(guid, itemData, 1)
+  lu.assertFalse(eligible, "a 1H drop that forces off an equipped 2H heirloom is not an upgrade")
+  lu.assertEquals(reason, "heirloom")
+end
+
+function TestMemberEligibility:test_a_heirloom_holdable_does_not_block_main_hand_drops()
+  -- subIDs only mean anything within an item class. A holdable is subID 0 — the same number
+  -- as a 1H axe — and an Ele Shaman's main hand takes axes. Running the equipped item's
+  -- subID through the WEAPON truth table without checking its equipLoc would report the
+  -- holdable as "duplicable into the main hand" and block every main-hand drop forever.
+  local guid = "Player-0-EleHoldable"
+  mockMemberGear(guid, "party1", "SHAMAN", 262, { [16] = 100, [17] = 200 })
+  _mockUnitLevel["party1"] = 50
+  equipHeirloom(guid, 17, 88850, 200, "INVTYPE_HOLDABLE", 0)
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:ele_mace", ilvl = 200, equipLoc = "INVTYPE_WEAPON",
+                     classID = 2, subID = 4, slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 4 }
+  local eligible, cand = checkMember(guid, itemData, 1)
+  lu.assertTrue(eligible, "a holdable is nobody's duplicate — the main hand is still beatable")
+  lu.assertEquals(cand.slotID, 16)
+  lu.assertEquals(cand.ilvl_current, 100)
+end
+
+function TestMemberEligibility:test_a_heirloom_main_hand_does_not_block_a_shield()
+  -- H2 cannot apply across item classes: a mace cannot be copied into a shield slot, and the
+  -- shield does not displace the mace. A Prot Paladin with an heirloom mace still wants a
+  -- better shield.
+  local guid = "Player-0-ProtPally"
+  mockMemberGear(guid, "party1", "PALADIN", 66, { [16] = 200, [17] = 180 })
+  _mockUnitLevel["party1"] = 50
+  equipHeirloom(guid, 16, 88820, 200, "INVTYPE_WEAPON", 5)
+  LIF.Cache.GetMember(guid).gear[17].equipLoc = "INVTYPE_SHIELD"
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:better_shield", ilvl = 220, equipLoc = "INVTYPE_SHIELD",
+                     classID = 4, subID = 6, slotCategory = "offhand", slotIDs = {17},
+                     offhandSubID = 6 }
+  local eligible, cand = checkMember(guid, itemData, 1)
+  lu.assertTrue(eligible, "an heirloom weapon must not block an off-hand ITEM upgrade")
+  lu.assertEquals(cand.slotID, 17)
+end
+
+function TestMemberEligibility:test_unresolved_heirloom_type_fails_closed()
+  -- We cannot tell whether the other hand is a real target without knowing the heirloom's
+  -- weapon type. Skip rather than guess.
+  local guid = "Player-0-HeirloomNoType"
+  mockMemberGear(guid, "party1", "DEATHKNIGHT", 251, { [16] = 200, [17] = 180 })
+  _mockUnitLevel["party1"] = 50
+  equipHeirloom(guid, 16, 88830, 200, "INVTYPE_WEAPON", nil)   -- subID never resolved
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:dw_axe", ilvl = 250, equipLoc = "INVTYPE_WEAPON",
+                     classID = 2, subID = 0, slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 0 }
+  local eligible, _, reason = checkMember(guid, itemData, 1)
+  lu.assertFalse(eligible, "an unresolved heirloom type must fail closed")
+  lu.assertNotNil(reason:find("unresolved", 1, true), "got: " .. tostring(reason))
+end
+
+-- ---------- unresolved (cold-cache) equipped ilvl — AUD-509 / AUD-530 ----------
+
+-- queue.lua caches a gear entry whenever the slot HOLDS an item, even if the item was
+-- cold in the client cache and its ilvl could not be resolved (link set, ilvl nil).
+-- An EMPTY slot gets no entry at all. The two must not be confused: empty = 0 = "any
+-- item is an upgrade"; unresolved = unknown = skip the member.
+
+-- Item still cold at LOOT time too: the cached ilvl is nil AND the link will not resolve.
+local function coldSlotIlvl(guid, slotID)
+  local m = LIF.Cache.GetMember(guid)
+  m.gear[slotID].ilvl = nil          -- inspect-time resolve failed
+  _mockIlvl[m.gear[slotID].link] = nil  -- and the item is STILL not in the client cache
+end
+
+-- Cached ilvl is nil, but the item HAS loaded into the client cache since the inspect.
+local function staleSlotIlvl(guid, slotID)
+  local m = LIF.Cache.GetMember(guid)
+  m.gear[slotID].ilvl = nil          -- link stays, and _mockIlvl still resolves it
+end
+
+function TestMemberEligibility:test_2h_drop_cold_offhand_ilvl_fails_closed()
+  -- Ele Shaman on 1H mace @180 + a HIGHER off-hand @220 → true pair average 200.
+  -- A 2H @190 loses to that average, so it must NOT be offered. Reading the unresolved
+  -- off-hand as 0 drops it out of the pair-average branch and judges the 2H against the
+  -- raw main hand (190 - 180 = +10) — a FALSE POSITIVE. Fail closed instead.
+  local guid = "Player-0-ColdOH"
+  mockMemberGear(guid, "party1", "SHAMAN", 262, { [16] = 180, [17] = 220 })
+  coldSlotIlvl(guid, 17)
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:staff190", ilvl = 190, equipLoc = "INVTYPE_2HWEAPON",
+                     classID = 2, subID = 10, slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 10 }
+  local eligible, cand, reason = checkMember(guid, itemData, 1)
+  lu.assertFalse(eligible, "an unresolved off-hand ilvl must not be judged against the main hand alone")
+  lu.assertNil(cand)
+  -- plain find: "-" and "(" are pattern metacharacters to a Lua matcher.
+  lu.assertNotNil(reason:find("unresolved", 1, true),
+    "the skip must state WHY, like its sibling M1 guards; got: " .. tostring(reason))
+end
+
+function TestMemberEligibility:test_cold_ilvl_recovers_when_the_item_has_since_loaded()
+  -- The cached ilvl is nil, but the item has loaded into the client cache since the
+  -- inspect. Re-resolve from the cached link rather than skipping the member: the true
+  -- pair average is 200, and a 2H @210 beats it by +10.
+  local guid = "Player-0-StaleOH"
+  mockMemberGear(guid, "party1", "SHAMAN", 262, { [16] = 180, [17] = 220 })
+  staleSlotIlvl(guid, 17)
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:staff210", ilvl = 210, equipLoc = "INVTYPE_2HWEAPON",
+                     classID = 2, subID = 10, slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 10 }
+  local eligible, cand = checkMember(guid, itemData, 1)
+  lu.assertTrue(eligible, "a nil cached ilvl that re-resolves must not skip the member")
+  lu.assertEquals(cand.ilvl_current, 200, "and it must compare against the recovered pair average")
+end
+
+function TestMemberEligibility:test_cold_main_hand_ilvl_fails_closed()
+  -- AUD-509 only ever covered slot 17. A cold MAIN hand is the same false positive:
+  -- MH reads 0, so the pair average of a 300 off-hand collapses to 150 and a 160 2H
+  -- looks like an upgrade when the member is wearing far better.
+  local guid = "Player-0-ColdMH"
+  mockMemberGear(guid, "party1", "SHAMAN", 262, { [16] = 300, [17] = 300 })
+  coldSlotIlvl(guid, 16)
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:staff160", ilvl = 160, equipLoc = "INVTYPE_2HWEAPON",
+                     classID = 2, subID = 10, slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 10 }
+  local eligible, cand, reason = checkMember(guid, itemData, 1)
+  lu.assertFalse(eligible, "a cold main hand must not read as ilvl 0")
+  lu.assertNil(cand)
+  lu.assertNotNil(reason:find("unresolved", 1, true), "got: " .. tostring(reason))
+end
+
+function TestMemberEligibility:test_cold_armor_ilvl_fails_closed()
+  -- The hole is not weapon-specific: every category compares `dropped - current`.
+  local guid = "Player-0-ColdChest"
+  mockMemberGear(guid, "party1", "SHAMAN", 262, { [5] = 300 })
+  coldSlotIlvl(guid, 5)
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:chest160", ilvl = 160, equipLoc = "INVTYPE_CHEST",
+                     classID = 4, subID = 3, armorType = "Mail",
+                     slotCategory = "armor", slotIDs = {5} }
+  local eligible, _, reason = checkMember(guid, itemData, 1)
+  lu.assertFalse(eligible, "a cold chest slot must not read as ilvl 0")
+  lu.assertNotNil(reason:find("unresolved", 1, true), "got: " .. tostring(reason))
+end
+
+function TestMemberEligibility:test_cold_ring_ilvl_fails_closed()
+  -- Ring/trinket take the LOWER of the two slots, so one cold slot reads 0 and becomes
+  -- the basis — the worst version of the bug.
+  local guid = "Player-0-ColdRing"
+  mockMemberGear(guid, "party1", "SHAMAN", 262, { [11] = 300, [12] = 300 })
+  coldSlotIlvl(guid, 11)
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:ring160", ilvl = 160, equipLoc = "INVTYPE_FINGER",
+                     classID = 4, subID = 0, slotCategory = "ring", slotIDs = {11, 12} }
+  local eligible, _, reason = checkMember(guid, itemData, 1)
+  lu.assertFalse(eligible, "a cold ring slot must not become the lower-of-two basis")
+  lu.assertNotNil(reason:find("unresolved", 1, true), "got: " .. tostring(reason))
+end
+
+function TestMemberEligibility:test_unresolved_heirloom_offhand_still_blocks_the_2h()
+  -- The gate exempts a slot holding an active heirloom (a heirloom wins on its link alone
+  -- and needs no ilvl). That exemption must not let the member fall through to a bare
+  -- main-hand compare: the pair-average branch owns the "a 2H displaces the heirloom
+  -- off-hand, so it is not an upgrade" rule (M2), and that branch is only reached if its
+  -- occupancy test sees the off-hand. Test occupancy by LINK — an unresolved heirloom's
+  -- ilvl reads 0, so an `ilvl > 0` test would skip the branch and offer the 2H.
+  local guid = "Player-0-HeirloomColdOH"
+  _mockGuids["party1"] = guid
+  _mockGuids["player"] = "GUID-SELF"
+  _mockUnitClass["party1"] = { "Shaman", "SHAMAN" }
+  _mockUnitLevel["party1"] = 50
+  _mockHeirloomItemIDs[44401] = true
+  LIF.Cache.Add(guid)
+  LIF.Cache.SetComplete(guid, { specID = 262, gear = {
+    [16] = { link = "item:44400", ilvl = 180, equipLoc = "INVTYPE_WEAPON" },
+    -- heirloom off-hand, and its ilvl never resolved (cold at inspect AND at loot time)
+    [17] = { link = "item:44401", ilvl = nil, equipLoc = "INVTYPE_WEAPONOFFHAND" },
+  } })
+
+  local itemData = { link = "item:staff190", ilvl = 190, equipLoc = "INVTYPE_2HWEAPON",
+                     classID = 2, subID = 10, slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 10 }
+  local eligible, cand, reason = checkMember(guid, itemData, 1)
+  lu.assertFalse(eligible,
+    "a 2H that displaces an active heirloom off-hand is not an upgrade, resolved ilvl or not")
+  lu.assertNil(cand)
+  lu.assertEquals(reason, "heirloom")
+end
+
+function TestMemberEligibility:test_an_empty_slot_still_reads_as_zero()
+  -- The other half of the rule, and the reason this is not a blanket "nil-guard every 0":
+  -- an EMPTY slot (no cache entry at all) genuinely IS ilvl 0, and ANY item is an upgrade
+  -- for it. The fail-closed gate must not touch that case.
+  local guid = "Player-0-BareNeck"
+  mockMemberGear(guid, "party1", "SHAMAN", 262, { [16] = 100 })   -- slot 2 (neck) empty
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:neck160", ilvl = 160, equipLoc = "INVTYPE_NECK",
+                     classID = 4, subID = 0, slotCategory = "neck", slotIDs = {2} }
+  local eligible, cand = checkMember(guid, itemData, 1)
+  lu.assertTrue(eligible, "an empty slot must stay an upgrade for anything")
+  lu.assertEquals(cand.ilvl_current, 0)
+end
+
+function TestMemberEligibility:test_2h_drop_resolved_offhand_still_averages()
+  -- Complement: with slot 17 resolved, the pair-average path is unchanged.
+  -- 1H @180 + off-hand @220 → avg 200. A 2H @210 clears it by +10.
+  local guid = "Player-0-WarmOH"
+  mockMemberGear(guid, "party1", "SHAMAN", 262, { [16] = 180, [17] = 220 })
+  _mockGuids["player"] = "GUID-SELF"
+
+  local itemData = { link = "item:staff210", ilvl = 210, equipLoc = "INVTYPE_2HWEAPON",
+                     classID = 2, subID = 10, slotCategory = "weapon", slotIDs = {16},
+                     weaponSubID = 10 }
+  local eligible, cand = checkMember(guid, itemData, 1)
+  lu.assertTrue(eligible)
+  lu.assertEquals(cand.ilvl_current, 200, "still compares against the average of both slots")
 end
 
 -- Member cmp-line enrichment: uses the existing TestMemberEligibility harness

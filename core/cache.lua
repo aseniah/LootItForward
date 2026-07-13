@@ -81,6 +81,23 @@ function LIF.ClearInspectRecords()
   for i = #inspectRecords, 1, -1 do inspectRecords[i] = nil end
 end
 
+-- ============================================================
+-- Member cache. This file is the ONLY writer of a cache entry (AUD-524): every
+-- mutation goes through one of the functions below, so the entry's shape is defined
+-- here rather than by the union of whoever happened to assign a field. Readers take
+-- the entry from GetMember/GetAll and read it directly.
+--
+-- Entry shape:
+--   guid            the member's GUID (also the table key)
+--   state           "PENDING" (needs a scan) | "COMPLETE" (gear is usable)
+--   gear            [slotID] = { link, ilvl, equipLoc }   -- ilvl may be nil on a cold
+--                   item cache; consumers fail closed on that (AUD-509)
+--   specID, specName, lvl, ilvl          captured at scan time (the member's name and
+--                   realm are NOT stored here — they go to RecordInspect only)
+--   scan progress   lastSlotCount, consistentCount, lastCountedTime — the D-15
+--                   stabilization counters. The POLICY for advancing them lives in
+--                   queue.lua; only the writes live here.
+-- ============================================================
 LIF.Cache = {}
 
 local cache = {}
@@ -93,6 +110,34 @@ end
 
 function LIF.Cache.Remove(guid)
   cache[guid] = nil
+end
+
+-- Send a COMPLETE member back to PENDING for a fresh scan (loot-time reinspect).
+-- RETAINS gear as a fallback snapshot: if the fresh inspect can't finish (member
+-- dead/offline, or the scanning window expires) the loot pipeline evaluates against
+-- the retained gear rather than dropping the member (D-14). Scan progress is cleared
+-- so the next run of INSPECT_READY fires counts from scratch.
+function LIF.Cache.SetPending(guid)
+  local m = cache[guid]
+  if not m then return end
+  m.state = "PENDING"
+  m.lastSlotCount = nil
+  m.consistentCount = nil
+  m.lastCountedTime = nil
+end
+
+-- Record a scan-stabilization observation. queue.lua decides WHETHER to advance the
+-- counters (D-15/M7); this just stores the result.
+function LIF.Cache.SetScanProgress(guid, lastSlotCount, consistentCount, lastCountedTime)
+  local m = cache[guid]
+  if not m then return end
+  m.lastSlotCount = lastSlotCount
+  m.consistentCount = consistentCount
+  m.lastCountedTime = lastCountedTime
+end
+
+function LIF.Cache.ClearScanProgress(guid)
+  LIF.Cache.SetScanProgress(guid, nil, nil, nil)
 end
 
 -- Marks a member COMPLETE and MERGES the given fields (does NOT replace): keys

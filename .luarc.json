@@ -14,10 +14,18 @@
     }
   },
   "workspace": {
-    "ignoreDir": ["libs", "tests"]
+    "ignoreDir": [
+      "libs",
+      "tests"
+    ],
+    "library": [
+      "~/.vscode/extensions/ketho.wow-api-0.22.3/Annotations"
+    ]
   },
   "diagnostics": {
-    "globals": ["BIND_TRADE_TIME_REMAINING"]
+    "globals": [
+      "BIND_TRADE_TIME_REMAINING"
+    ]
   },
   "type": {
     "weakUnionCheck": true

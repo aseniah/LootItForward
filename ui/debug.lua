@@ -2,49 +2,33 @@ local _, LIF = ...
 
 local frame, refreshTicker
 
-local DEBUG_WIDTH = 420   -- matches f:SetSize below
-local MIN_ONSCREEN = 40   -- px of the frame that must stay visible
-local TITLE_STRIP = 22    -- draggable title height; keep it within the screen
+-- Geometry the shared position rules (core/frame_position.lua) judge this window by.
+-- width matches f:SetSize below; titleStrip is the draggable title height, which has to
+-- stay on screen for the window to be reachable.
+local DEBUG_GEOM = { width = 420, titleStrip = 22 }
 
--- Is a saved (x, y) actually on the current screen? Anchor is TOPLEFT against
--- UIParent BOTTOMLEFT, so x is the left edge and y the top edge's height above the
--- bottom. Positive-form comparisons so a NaN coord reads as off-screen. Mirrors the
--- popup's _isOnScreen so both windows judge a saved position the same way.
-local function _isOnScreen(x, y)
-  if type(x) ~= "number" or type(y) ~= "number" then return false end
-  local w = UIParent:GetWidth() or 1024
-  local h = UIParent:GetHeight() or 768
-  local visibleW = math.min(x + DEBUG_WIDTH, w) - math.max(x, 0)
-  if not (visibleW >= MIN_ONSCREEN) then return false end
-  if not (y <= h and y >= TITLE_STRIP) then return false end
-  return true
-end
-
--- Resolve the saved position, self-healing a corrupt/off-screen one: return its
--- coords if valid AND on-screen, else CLEAR the stored value (so it stops
--- persisting a lost point — the debug window used to rely only on the runtime
--- SetClampedToScreen, leaving a bad save in place forever) and return nil so the
--- caller centres. Matches the popup's _resolvePopupPosition self-heal.
+-- Resolve the saved position: its coords if valid AND on-screen, else nil so the caller
+-- centres. A corrupt or off-screen save is CLEARED rather than left to persist a lost
+-- point (the runtime SetClampedToScreen only clamps the live frame; it never fixes the
+-- stored value).
 local function _resolveDebugPosition()
   local pos = LootItForward and LootItForward.db and LootItForward.db.char.debugPosition
-  if pos and _isOnScreen(pos.x, pos.y) then
-    return pos.x, pos.y
+  local verdict, x, y = LIF.ResolveSavedPosition(pos, DEBUG_GEOM,
+    UIParent:GetWidth() or 1024, UIParent:GetHeight() or 768)
+  if verdict == "saved" then
+    return x, y
   end
-  if pos and LootItForward and LootItForward.db then
+  if verdict ~= "none" and LootItForward and LootItForward.db then
     LootItForward.db.char.debugPosition = nil
-    LIF.Log("debug: saved position off-screen — re-centering")
+    LIF.Log(verdict == "offscreen"
+      and "debug: saved position off-screen — re-centering"
+      or "debug: ignoring corrupt saved position — re-centering")
   end
   return nil
 end
 
 local function _saveDebugPosition()
-  local xOfs = frame:GetLeft() - UIParent:GetLeft()
-  local yOfs = frame:GetTop() - UIParent:GetBottom()
-  frame:ClearAllPoints()
-  frame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", xOfs, yOfs)
-  if LootItForward and LootItForward.db then
-    LootItForward.db.char.debugPosition = { x = xOfs, y = yOfs }
-  end
+  LIF.SaveDraggedPosition(frame, "debugPosition", "debug")
 end
 
 function LIF.Debug_RestorePosition()
@@ -129,7 +113,7 @@ end
 
 local function createFrame()
   local f = CreateFrame("Frame", "LIFDebugFrame", UIParent, "BackdropTemplate")
-  f:SetSize(DEBUG_WIDTH, 264)
+  f:SetSize(DEBUG_GEOM.width, 264)
   local x, y = _resolveDebugPosition()
   if x and y then
     f:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", x, y)

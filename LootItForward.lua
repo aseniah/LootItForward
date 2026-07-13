@@ -19,9 +19,12 @@ local defaults = {
 
 function LootItForward:OnInitialize()
   self.db = LibStub("AceDB-3.0"):New("LootItForwardDB", defaults, true)
+  -- Read before InitSettings: the settings canvas is built eagerly in there and prints
+  -- the version beside its title. Shared by the log header and /lif so all three read
+  -- the TOC once.
+  LIF.VERSION = C_AddOns.GetAddOnMetadata("LootItForward", "Version") or "?"
   if LIF.InitSettings then LIF.InitSettings() end
-  local ver = C_AddOns.GetAddOnMetadata("LootItForward", "Version") or "?"
-  LootItForwardLog = LIF.InitLog(LootItForwardLog, ver)
+  LootItForwardLog = LIF.InitLog(LootItForwardLog, LIF.VERSION)
   -- Debug window is shown from PLAYER_ENTERING_WORLD (fires at login/reload), NOT
   -- here: at OnInitialize the UI scale isn't settled, so the position self-heal's
   -- UIParent:GetHeight() check would judge a valid saved position off-screen and wipe
@@ -118,6 +121,7 @@ function LootItForward:OnInitialize()
       end
     elseif msg == "" then
       local p = LIF.Print
+      p("Loot It Forward v" .. LIF.VERSION)
       p("Commands:")
       p("  /lif settings   — open settings panel")
       p("  /lif example    — show example popup (drag to reposition)")
@@ -157,6 +161,11 @@ function LootItForward:OnEnable()
   self:RegisterEvent("ADDON_ACTION_BLOCKED")
 end
 
+-- AceAddon lifecycle hook, NOT the addon's off switch. It runs only if something calls
+-- LootItForward:Disable(), and nothing does — so this never executes today. Kept as the
+-- correct teardown should that ever change; do not reason about runtime behaviour from
+-- it. The state the addon actually enters is INACTIVE (ShouldBeActive() false), torn
+-- down in the inactive branches of GROUP_ROSTER_UPDATE and PLAYER_ENTERING_WORLD.
 function LootItForward:OnDisable()
   LIF.Queue_StopAndReset()
   if LIF.Loot_Reset then LIF.Loot_Reset() end
@@ -168,36 +177,13 @@ end
 --       Cache.Clear + Loot_Reset + Popup_OnRosterUpdate (prunes departed rows)
 --   PLAYER_ENTERING_WORLD inactive                    : Queue_StopAndReset +
 --       Cache.Clear + Loot_Reset; popup dismissed on a location change (above)
---   OnDisable                                         : Queue_StopAndReset +
---       Loot_Reset; cache RETAINED intentionally (L6); popup untouched (addon off)
--- The cache-retention asymmetry on OnDisable is deliberate, not an oversight.
+-- Those two ARE the runtime paths. OnDisable is unreachable (see above) and is
+-- deliberately absent from this matrix.
 
+-- Adapter over LIF.ComputeActive (core/loot.lua), which holds the actual truth table
+-- so it can be tested offline (AUD-520). Keep this a one-liner: rules belong there.
 function LootItForward:ShouldBeActive()
-  -- Pure check, no side effects (REV-013): every inactive caller path clears
-  -- the cache itself, and the debug window polls this every 3 seconds.
-  if IsInRaid() then
-    -- Covers instanced AND open world raid groups (CON-006, DEC-004)
-    return false
-  end
-  if not IsInGroup() then
-    return false
-  end
-  -- Below the configured minimum party size the addon is fully disabled (AUD-009),
-  -- not merely popup-suppressed. Bidirectional: crossing the threshold via a join
-  -- re-activates through GROUP_ROSTER_UPDATE; dropping below runs its cleanup branch.
-  if LIF.GroupMeetsMinPartySize and not LIF.GroupMeetsMinPartySize() then
-    return false
-  end
-  local inInstance, instanceType = IsInInstance()
-  if inInstance and instanceType == "party" then
-    -- All 5-player difficulties: normal, heroic, mythic, timewalking (CON-007)
-    return true
-  end
-  if not inInstance and self.db and self.db.profile.enableOpenWorld then
-    return true
-  end
-  -- arena, pvp, raid instance, scenario, neighborhood, interior -> inactive
-  return false
+  return LIF.ComputeActive()
 end
 
 function LootItForward:PLAYER_ENTERING_WORLD()
@@ -285,6 +271,12 @@ function LootItForward:PLAYER_REGEN_ENABLED()
   -- burst where other addons (e.g. Details) do their combat-end processing.
   -- NotifyInspect in that window can trigger bugs in third-party code.
   C_Timer.After(1, function()
+    -- The addon can go INACTIVE inside this 1-second window (a member leaves, the
+    -- min-party-size setting is raised), and an inactive addon must not drive an
+    -- inspect. Gate on the active predicate, not AceAddon's IsEnabled(): nothing
+    -- calls LootItForward:Disable(), so IsEnabled() is always true and would never
+    -- stop this.
+    if not self:ShouldBeActive() then return end
     LIF.TryQueuePendingMembers()
     -- Run loot reinspects deferred while combat was active; the same settle
     -- delay applies since these also NotifyInspect via RequestReinspect.
