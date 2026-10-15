@@ -317,7 +317,7 @@ LIF.GetItemPrimaryStats = GetItemPrimaryStats
 -- ============================================================
 local function ClassifyItem(itemLink, itemID)
   local name, _, rarity, ilvl, _, itype, subtype, _, equipLoc, _, _, classID, subID, bindType =
-    GetItemInfo(itemLink)
+    C_Item.GetItemInfo(itemLink)
 
   if name == nil then
     LIF.Log("classify warn: GetItemInfo nil for " .. tostring(itemLink))
@@ -701,7 +701,7 @@ function LIF.CountTradeableSlots(itemID)
 end
 
 function LIF.IsItemTradeable(itemLink, itemID)
-  local bindType = select(14, GetItemInfo(itemLink))
+  local bindType = select(14, C_Item.GetItemInfo(itemLink))
 
   if bindType then
     -- Account-bound: never player-tradeable.
@@ -822,7 +822,7 @@ function LIF.OnPlayerLootReceived(itemLink, itemID, opts)
   -- GetItemInfo returns nil for items the client hasn't seen (e.g. first kill
   -- of a new boss) — exactly the drops worth evaluating. Defer ONE retry via
   -- ItemMixin; opts._retried guards against loops if data never loads.
-  if itemLink and GetItemInfo(itemLink) == nil and not (opts and opts._retried) then
+  if itemLink and C_Item.GetItemInfo(itemLink) == nil and not (opts and opts._retried) then
     if Item and Item.CreateFromItemLink then
       local item = Item:CreateFromItemLink(itemLink)
       if item and not item:IsItemEmpty() then
@@ -1183,7 +1183,7 @@ end
 local function Is2HWeaponEquipped(unit)
   local link = GetInventoryItemLink(unit, 16)
   if link == nil then return false end
-  local _, _, _, _, _, _, _, _, equipLoc = GetItemInfo(link)
+  local _, _, _, _, _, _, _, _, equipLoc = C_Item.GetItemInfo(link)
   return equipLoc == "INVTYPE_2HWEAPON"
 end
 
@@ -1564,12 +1564,12 @@ function LIF.IsPlayerUpgrade(itemData, threshold)
     getSlotEquipLoc = function(slot)
       local link = GetInventoryItemLink("player", slot)
       if not link then return nil end
-      return select(9, GetItemInfo(link))
+      return select(9, C_Item.GetItemInfo(link))
     end,
     getSlotSubID    = function(slot)
       local link = GetInventoryItemLink("player", slot)
       if not link then return nil end
-      return select(13, GetItemInfo(link))
+      return select(13, C_Item.GetItemInfo(link))
     end,
     is2HEquipped    = function() return Is2HWeaponEquipped("player") end,
   }
@@ -1642,7 +1642,7 @@ local function _checkMemberEligibility(itemData, member, unit, threshold)
     if not g then return 0 end
     if g.ilvl then return g.ilvl end
     if not g.link then return 0 end
-    local _, _, _, itemIlvl = GetItemInfo(g.link)
+    local _, _, _, itemIlvl = C_Item.GetItemInfo(g.link)
     return itemIlvl or C_Item.GetDetailedItemLevelInfo(g.link)   -- still nil if cold
   end
   -- Every comparison site needs a number, and the gate above them rejects the unknown
@@ -1659,7 +1659,7 @@ local function _checkMemberEligibility(itemData, member, unit, threshold)
     return g and g.link
   end
   -- equipLoc captured per slot at inspect time (queue.lua). Reading it from the
-  -- cache — rather than re-calling GetItemInfo(cachedLink) live here — is the M1
+  -- cache — rather than re-calling C_Item.GetItemInfo(cachedLink) live here — is the M1
   -- fix: at loot time the item may have aged out of the local cache, so a live
   -- read returns nil and a real 2H reads as not-2H. Still nil if it couldn't be
   -- resolved even at inspect time; the offhand branch fails closed on that.

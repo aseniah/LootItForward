@@ -429,7 +429,7 @@ function LIF.OnInspectReady(guid)
       -- "could this member equip a COPY of that heirloom in their other hand?" is a
       -- SPEC_TABLE lookup of the EQUIPPED item's subID (D-17). Either may still be nil here
       -- on a cold cache; consumers fail closed on nil.
-      local _, _, _, itemIlvl, _, _, _, _, equipLoc, _, _, _, subID = GetItemInfo(link)
+      local _, _, _, itemIlvl, _, _, _, _, equipLoc, _, _, _, subID = C_Item.GetItemInfo(link)
       local actualIlvl = itemIlvl or C_Item.GetDetailedItemLevelInfo(link)
       gearData[slotID] = { link = link, ilvl = actualIlvl, equipLoc = equipLoc, subID = subID }
     end
